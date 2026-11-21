@@ -966,9 +966,10 @@ void OnPlayDrawBeginChaosControl() {
 
 } // namespace
 
-// Used by Jump.cpp: true from the moment Chaos Control starts until it ends, so Y cannot jump out of it.
+// Used by Jump.cpp and Boost.cpp: true only while the start pose plays (Link is held still), so Y and X cannot break
+// out of the pose. Once time has stopped (State::Active) Link is free, so he can jump, double jump and boost.
 extern "C" bool ShadowChaosControl_IsBusy(void) {
-    return sState != State::Idle;
+    return sState == State::Windup;
 }
 
 // ----- The duration bar ---------------------------------------------------------------------------
