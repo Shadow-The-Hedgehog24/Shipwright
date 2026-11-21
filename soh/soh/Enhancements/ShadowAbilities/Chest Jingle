@@ -20,11 +20,14 @@
 //   gShadow.ChestJingle.Offset           milliseconds added to the drop time. Negative = drop earlier, positive = later
 //   gShadow.ChestJingle.KeepItemFanfare  0 = also mute the "You got an item" fanfare while the tune plays (default),
 //                                        1 = let it play
+//   gShadow.ChestJingle.Debug            1 = small on-screen messages: when the game loads (is the tune found?), when
+//                                        a chest fanfare is seen, when the tune starts. Default 1 while testing, 0 = silent.
 
 #include <libultraship/bridge/consolevariablebridge.h>
 
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
 #include "soh/ShipInit.hpp"
+#include "soh/Notification/Notification.h"
 
 #include <SDL2/SDL.h>
 #include <ship/Context.h>
@@ -56,6 +59,7 @@ constexpr const char* kCvarEnabled = "gShadow.ChestJingle.Enabled";
 constexpr const char* kCvarVolume = "gShadow.ChestJingle.Volume";
 constexpr const char* kCvarOffset = "gShadow.ChestJingle.Offset";
 constexpr const char* kCvarKeepItemFanfare = "gShadow.ChestJingle.KeepItemFanfare";
+constexpr const char* kCvarDebug = "gShadow.ChestJingle.Debug";
 constexpr const char* kFileJingle = "custom/chest_jingle/jingle.wav";
 constexpr const char* kFileConfig = "custom/chest_jingle/config.txt";
 
@@ -80,7 +84,15 @@ std::atomic<bool> sPlaying{ false };
 
 // set on the audio thread when the chest fanfare starts, read and cleared on the game thread
 std::atomic<bool> sArmed{ false };
+std::atomic<bool> sSawFanfare{ false }; // the chest fanfare started (whether or not the tune is loaded)
 int sArmedFrames = 0; // game thread only
+
+// A small on-screen message (bottom right) while the jingle is being tested. Game thread only.
+void Say(const std::string& text) {
+    if (CVarGetInteger(kCvarDebug, 1) != 0) {
+        Notification::Emit({ .message = text, .remainingTime = 5.0f, .mute = true });
+    }
+}
 
 void SDLCALL MixCallback(void*, Uint8* stream, int len) {
     int16_t* out = reinterpret_cast<int16_t*>(stream);
@@ -231,6 +243,9 @@ void StopJingle() {
 // The muted fanfare keeps running silently, so the game's own timing (music ducking and restoring) is not disturbed,
 // and the game resets the volume the next time it starts a fanfare.
 void OnSeqPlayerInitChestJingle(int32_t playerIdx, int32_t seqId) {
+    if (playerIdx == SEQ_PLAYER_FANFARE && (seqId & 0xFF) == NA_BGM_OPEN_TRE_BOX) {
+        sSawFanfare.store(true);
+    }
     if (!sReady || playerIdx != SEQ_PLAYER_FANFARE || !CVarGetInteger(kCvarEnabled, 1)) {
         return;
     }
@@ -245,6 +260,9 @@ void OnSeqPlayerInitChestJingle(int32_t playerIdx, int32_t seqId) {
 
 // Game thread, once per game frame.
 void OnPlayerUpdateChestJingle() {
+    if (sSawFanfare.exchange(false)) {
+        Say(sReady ? "Chest fanfare seen, jingle armed" : "Chest fanfare seen, but the jingle tune is NOT loaded");
+    }
     if (!sReady || gPlayState == nullptr || !sArmed.load()) {
         sArmedFrames = 0;
         return;
@@ -254,6 +272,7 @@ void OnPlayerUpdateChestJingle() {
     if (sDropMs <= 0) {
         sArmed.store(false);
         PlayJingle(0);
+        Say("Chest jingle playing");
         return;
     }
 
@@ -266,6 +285,7 @@ void OnPlayerUpdateChestJingle() {
         if (sArmedFrames > kGiveUpFrames) {
             sArmed.store(false);
             PlayJingle(0);
+            Say("Chest jingle playing (no chest animation seen)");
         }
         return;
     }
@@ -280,13 +300,18 @@ void OnPlayerUpdateChestJingle() {
     if (msUntilItem <= dropMs) {
         sArmed.store(false);
         PlayJingle(static_cast<int>(dropMs - msUntilItem)); // 0 when on time, a little more if we are late
+        Say("Chest jingle playing");
     }
 }
 
 void RegisterChestJingle() {
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnSeqPlayerInit>(OnSeqPlayerInitChestJingle);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayerUpdate>(OnPlayerUpdateChestJingle);
-    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnLoadGame>([](int32_t) { LoadJingle(); });
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnLoadGame>([](int32_t) {
+        LoadJingle();
+        Say(sReady ? "Shadow chest jingle ready (tune loaded)"
+                   : "Shadow chest jingle code is here, but the tune was NOT found (chaos_control_audio.o2r)");
+    });
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnSceneInit>([](int16_t) {
         LoadJingle();
         sArmed.store(false);
