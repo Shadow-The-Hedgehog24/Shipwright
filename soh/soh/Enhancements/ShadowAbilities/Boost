@@ -1,0 +1,677 @@
+// Shadow the Hedgehog - Boost (the X button) for Ship of Harkinian 9.3.1
+//
+// Hold X on the ground: Shadow drops into a short crouch (SA2 animation 100), then bursts forward in his fast skating
+// run (SA2 animation 174) at a much higher speed than Link's normal run. Let go of X and he slows down to a normal
+// run again. Steer with the stick as usual.
+//
+// The crouch and the run are poses that are put onto Link's skeleton while the game draws him (the same way the
+// Chaos Control pose works). They are inside chaos_control_audio.o2r (custom/boost/*). Without that file the boost still
+// works, just without the special poses.
+//
+// The boost ends by itself when: X is let go, Link leaves the ground, starts a roll / sword swing / anything else,
+// starts Z-targeting, runs into a wall for a moment, or the stick has been let go for a moment and he has stopped.
+//
+// Everything is in this one file. CMake picks it up automatically (soh/*.cpp is globbed).
+//
+// Settings (CVars, change with the in-game console: set <name> <value>):
+//   gShadow.Boost.Enabled        1 = on (default), 0 = off
+//   gShadow.Boost.SdlButton      controller button, default 2 (X). 0 = A, 1 = B, 3 = Y, 9 = left shoulder, 10 = right shoulder
+//   gShadow.Boost.N64Button      also accept this N64 button number from the game's own controller mapping, default 0 = none
+//   gShadow.Boost.BlockButtons   N64 buttons that are hidden from the game while X is held, default 16384 (the B button).
+//                                SoH's default controller layout puts the sword (B) on the X button; this stops the boost
+//                                from swinging the sword. Set 0 if X is not also your sword button and you want to swing while boosting.
+//   gShadow.Boost.Mode           0 = hold X (default), 1 = toggle (press X to start, press X again to stop)
+//   gShadow.Boost.Speed          boost speed, default 13 (Link's normal run is about 6.6; a sword lunge is 15)
+//   gShadow.Boost.Accel          how fast the speed builds up per game frame, default 3
+//   gShadow.Boost.CrouchSpeed    top speed during the crouch, default 2 (so the burst is a burst)
+//   gShadow.Boost.Animation      1 = use the crouch and skating poses (default), 0 = only the speed
+//   gShadow.Boost.StartRate      playback speed of the crouch in percent, default 100
+//   gShadow.Boost.RunRate        playback speed of the skating run in percent, default 100
+
+#include <libultraship/bridge/consolevariablebridge.h>
+
+#include "soh/Enhancements/game-interactor/GameInteractor.h"
+#include "soh/ShipInit.hpp"
+
+#include <SDL2/SDL.h>
+#include <ship/Context.h>
+#include <ship/resource/File.h>
+#include <ship/resource/ResourceManager.h>
+#include <ship/resource/archive/ArchiveManager.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+
+extern "C" {
+#include "z64.h"
+#include "macros.h"
+#include "functions.h"
+#include "variables.h"
+extern PlayState* gPlayState;
+
+// The game's own "where does the stick point" (target speed and direction, the direction is relative to the camera).
+s32 Player_GetMovementSpeedAndYaw(Player* player, f32* outSpeedTarget, s16* outYawTarget, f32 speedMode,
+                                  PlayState* play);
+
+// The actions Link is in while standing, walking or running freely on the ground.
+void Player_Action_Idle(Player* player, PlayState* play);
+void Player_Action_80842180(Player* player, PlayState* play); // running
+void Player_Action_80840450(Player* player, PlayState* play);
+void Player_Action_808407CC(Player* player, PlayState* play);
+void Player_Action_80840DE4(Player* player, PlayState* play);
+void Player_Action_808414F8(Player* player, PlayState* play);
+void Player_Action_8084170C(Player* player, PlayState* play);
+void Player_Action_808417FC(Player* player, PlayState* play);
+}
+
+// Provided by ChaosControl.cpp. True while Chaos Control holds Link still. Weak, so this file also works without it.
+extern "C" __attribute__((weak)) bool ShadowChaosControl_IsBusy(void);
+
+namespace {
+
+constexpr const char* kCvarEnabled = "gShadow.Boost.Enabled";
+constexpr const char* kCvarSdlButton = "gShadow.Boost.SdlButton";
+constexpr const char* kCvarN64Button = "gShadow.Boost.N64Button";
+constexpr const char* kCvarBlock = "gShadow.Boost.BlockButtons";
+constexpr const char* kCvarMode = "gShadow.Boost.Mode";
+constexpr const char* kCvarSpeed = "gShadow.Boost.Speed";
+constexpr const char* kCvarAccel = "gShadow.Boost.Accel";
+constexpr const char* kCvarCrouchSpeed = "gShadow.Boost.CrouchSpeed";
+constexpr const char* kCvarAnimation = "gShadow.Boost.Animation";
+constexpr const char* kCvarStartRate = "gShadow.Boost.StartRate";
+constexpr const char* kCvarRunRate = "gShadow.Boost.RunRate";
+
+constexpr const char* kFileStartAdult = "custom/boost/anim_start_adult.bin";
+constexpr const char* kFileStartChild = "custom/boost/anim_start_child.bin";
+constexpr const char* kFileLoopAdult = "custom/boost/anim_loop_adult.bin";
+constexpr const char* kFileLoopChild = "custom/boost/anim_loop_child.bin";
+constexpr const char* kFileConfig = "custom/boost/config.txt";
+
+constexpr uint32_t kPressLifetimeMs = 150; // a press seen by the event listener counts for this long
+constexpr float kChildSpeedScale = 0.9f;
+constexpr float kPoseSpeed = 5.5f;         // below this speed (after the crouch) the game's own pose is shown
+constexpr int kMaxAirFrames = 3;           // game frames in the air before the boost ends
+constexpr int kStuckFrames = 8;            // game frames against a wall before the boost ends
+constexpr int kNeutralFrames = 8;          // game frames standing still with the stick let go before the boost ends
+constexpr int kFadeOutFrames = 4;
+constexpr float kStickThreshold = 22.0f;  // the game ignores a stick below about 20
+
+// Limbs the game drives itself (hat, collar, sheath, torso): the pose leaves them alone.
+inline bool KeepGameLimb(int limb) {
+    return limb == 11 || limb == 12 || limb == 19 || limb == 20;
+}
+
+// ------------------------------------------------------------------------------------------------
+// Reading the X button
+// ------------------------------------------------------------------------------------------------
+
+std::atomic<int> sWatchedButton{ SDL_CONTROLLER_BUTTON_X };
+std::atomic<bool> sPressPending{ false };
+std::atomic<uint32_t> sPressTick{ 0 };
+bool sWatchAdded = false;
+bool sPolledDown = false;
+
+int SDLCALL OnSdlEvent(void*, SDL_Event* event) {
+    if (event->type == SDL_CONTROLLERBUTTONDOWN && event->cbutton.button == sWatchedButton.load()) {
+        sPressTick = SDL_GetTicks();
+        sPressPending = true;
+    }
+    return 0;
+}
+
+bool AnyControllerHolds(int button) {
+    const int count = SDL_NumJoysticks();
+    for (int i = 0; i < count; i++) {
+        if (!SDL_IsGameController(i)) {
+            continue;
+        }
+        SDL_GameController* controller = SDL_GameControllerFromInstanceID(SDL_JoystickGetDeviceInstanceID(i));
+        if (controller != nullptr && SDL_GameControllerGetButton(controller, static_cast<SDL_GameControllerButton>(button))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void EnsureWatch() {
+    if (!sWatchAdded) {
+        SDL_AddEventWatch(OnSdlEvent, nullptr);
+        sWatchAdded = true;
+    }
+    sWatchedButton = CVarGetInteger(kCvarSdlButton, SDL_CONTROLLER_BUTTON_X);
+}
+
+bool sHeld = false; // X is down right now (read once per game frame)
+
+// Reads the button once per game frame. Returns true once per press.
+bool ReadButton() {
+    EnsureWatch();
+    const int button = CVarGetInteger(kCvarSdlButton, SDL_CONTROLLER_BUTTON_X);
+
+    bool pressed = false;
+    if (sPressPending.exchange(false) && SDL_GetTicks() - sPressTick.load() <= kPressLifetimeMs) {
+        pressed = true;
+    }
+    const bool down = AnyControllerHolds(button);
+    if (down && !sPolledDown) {
+        pressed = true;
+    }
+    sPolledDown = down;
+    sHeld = down;
+
+    const int n64Button = CVarGetInteger(kCvarN64Button, 0);
+    if (n64Button != 0 && gPlayState != nullptr) {
+        if (CHECK_BTN_ANY(gPlayState->state.input[0].press.button, n64Button)) {
+            pressed = true;
+        }
+        if (CHECK_BTN_ANY(gPlayState->state.input[0].cur.button, n64Button)) {
+            sHeld = true;
+        }
+    }
+    return pressed;
+}
+
+// ------------------------------------------------------------------------------------------------
+// The poses (SA2 animation 100 for the crouch, 174 for the run; Link's 21 limbs, 20 frames per second)
+// One frame = 22 Vec3s (root position, then 21 limb rotations) + 1 face value, 67 big-endian s16.
+// ------------------------------------------------------------------------------------------------
+
+constexpr int kJoints = 22;
+constexpr int kShortsPerFrame = kJoints * 3 + 1;
+
+struct AnimData {
+    std::vector<int16_t> data;
+    int frames = 0;
+};
+
+AnimData sStartAdult, sStartChild, sLoopAdult, sLoopChild;
+int sStartFrames = 8; // the crouch part of the start animation (the rest of it is the morph into the run)
+int sMorphFrames = 4; // loop frame the run continues at after the start animation
+bool sAssetsTried = false;
+
+std::shared_ptr<Ship::File> LoadModFile(const std::string& path) {
+    Ship::Context* ctx = Ship::Context::GetRawInstance();
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    auto resourceManager = ctx->GetResourceManager();
+    if (resourceManager == nullptr) {
+        return nullptr;
+    }
+    auto archiveManager = resourceManager->GetArchiveManager();
+    if (archiveManager == nullptr || !archiveManager->HasFile(path)) {
+        return nullptr;
+    }
+    auto file = archiveManager->LoadFile(path);
+    if (file == nullptr || file->Buffer == nullptr || file->Buffer->empty()) {
+        return nullptr;
+    }
+    return file;
+}
+
+void LoadAnim(const char* path, AnimData& out) {
+    auto file = LoadModFile(path);
+    if (file == nullptr) {
+        return;
+    }
+    const std::vector<char>& bytes = *file->Buffer;
+    const size_t frameBytes = static_cast<size_t>(kShortsPerFrame) * 2;
+    const size_t frames = bytes.size() / frameBytes;
+    if (frames == 0) {
+        return;
+    }
+    out.data.resize(frames * static_cast<size_t>(kShortsPerFrame));
+    for (size_t i = 0; i < out.data.size(); i++) {
+        out.data[i] = static_cast<int16_t>((static_cast<uint8_t>(bytes[i * 2]) << 8) |
+                                           static_cast<uint8_t>(bytes[i * 2 + 1]));
+    }
+    out.frames = static_cast<int>(frames);
+}
+
+void ParseConfig(const std::string& text) {
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line)) {
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        const std::string key = line.substr(0, eq);
+        const int value = std::atoi(line.c_str() + eq + 1);
+        if (key == "morph_frames" && value >= 0) {
+            sMorphFrames = value;
+        } else if (key == "start_frames" && value > 0) {
+            sStartFrames = value;
+        }
+    }
+}
+
+void LoadAssets() {
+    if (sAssetsTried) {
+        return;
+    }
+    sAssetsTried = true;
+    LoadAnim(kFileStartAdult, sStartAdult);
+    LoadAnim(kFileStartChild, sStartChild);
+    LoadAnim(kFileLoopAdult, sLoopAdult);
+    LoadAnim(kFileLoopChild, sLoopChild);
+    auto config = LoadModFile(kFileConfig);
+    if (config != nullptr) {
+        ParseConfig(std::string(config->Buffer->begin(), config->Buffer->end()));
+    }
+}
+
+bool IsChild() {
+    return gSaveContext.linkAge == LINK_AGE_CHILD;
+}
+
+const AnimData& StartAnim() {
+    return IsChild() ? sStartChild : sStartAdult;
+}
+
+const AnimData& LoopAnim() {
+    return IsChild() ? sLoopChild : sLoopAdult;
+}
+
+bool HavePoses() {
+    return StartAnim().frames > 0 && LoopAnim().frames > 0;
+}
+
+inline int16_t LerpS16(int16_t a, int16_t b, float w) {
+    return static_cast<int16_t>(a + static_cast<int>(std::lround(static_cast<float>(b - a) * w)));
+}
+
+// Rotations: blend the short way around the circle.
+inline int16_t LerpAngle(int16_t a, int16_t b, float w) {
+    const int16_t diff = static_cast<int16_t>(b - a);
+    return static_cast<int16_t>(a + static_cast<int>(std::lround(static_cast<float>(diff) * w)));
+}
+
+// The pose at frame time t of an animation (between two frames it is blended). A loop wraps around.
+void SamplePose(const AnimData& anim, float t, bool wrap, Vec3s out[kJoints]) {
+    const int frames = anim.frames;
+    int i0 = static_cast<int>(std::floor(t));
+    const float frac = t - static_cast<float>(i0);
+    int i1 = i0 + 1;
+    if (wrap) {
+        i0 = ((i0 % frames) + frames) % frames;
+        i1 = ((i1 % frames) + frames) % frames;
+    } else {
+        i0 = std::max(0, std::min(i0, frames - 1));
+        i1 = std::max(0, std::min(i1, frames - 1));
+    }
+    const int16_t* a = &anim.data[static_cast<size_t>(i0) * kShortsPerFrame];
+    const int16_t* b = &anim.data[static_cast<size_t>(i1) * kShortsPerFrame];
+    for (int j = 0; j < kJoints; j++) {
+        if (j == 0) { // root position
+            out[j].x = LerpS16(a[0], b[0], frac);
+            out[j].y = LerpS16(a[1], b[1], frac);
+            out[j].z = LerpS16(a[2], b[2], frac);
+        } else {
+            out[j].x = LerpAngle(a[j * 3 + 0], b[j * 3 + 0], frac);
+            out[j].y = LerpAngle(a[j * 3 + 1], b[j * 3 + 1], frac);
+            out[j].z = LerpAngle(a[j * 3 + 2], b[j * 3 + 2], frac);
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// The boost
+// ------------------------------------------------------------------------------------------------
+
+enum class State { Idle, Active };
+
+State sState = State::Idle;
+bool sInStart = false;       // the crouch (and the morph into the run) is playing; false = the run loop
+float sAnimT = 0.0f;         // frame time in the start animation, or in the loop
+float sBoostSpeed = 0.0f;    // the speed we are driving Link at
+float sWeight = 0.0f;        // how much of the pose is shown (0 = the game's own pose, 1 = ours)
+int sAirFrames = 0;
+int sStuckCount = 0;
+int sNeutralCount = 0;
+float sLastX = 0.0f;
+float sLastZ = 0.0f;
+
+int sFadeOut = 0;            // frames left of blending the pose out after the boost ended
+float sFadeWeight = 0.0f;
+bool sHavePose = false;
+Vec3s sLastPose[kJoints];
+
+// Hiding the sword button while X is held (see gShadow.Boost.BlockButtons).
+bool sInputHidden = false;
+u16 sHiddenCur = 0;
+u16 sHiddenPress = 0;
+
+bool ChaosControlBusy() {
+    return ShadowChaosControl_IsBusy != nullptr && ShadowChaosControl_IsBusy();
+}
+
+// True when Link is not in control or is in a state where boosting makes no sense.
+bool CannotBoost(Player* player) {
+    if (gPlayState->csCtx.state != CS_STATE_IDLE || Player_InCsMode(gPlayState)) {
+        return true;
+    }
+    if (gPlayState->pauseCtx.state != 0 || gPlayState->transitionTrigger != TRANS_TRIGGER_OFF ||
+        gPlayState->msgCtx.msgMode != MSGMODE_NONE) {
+        return true;
+    }
+    const u32 blocked1 = PLAYER_STATE1_INPUT_DISABLED | PLAYER_STATE1_TALKING | PLAYER_STATE1_DEAD |
+                         PLAYER_STATE1_GETTING_ITEM | PLAYER_STATE1_IN_CUTSCENE | PLAYER_STATE1_IN_WATER |
+                         PLAYER_STATE1_ON_HORSE | PLAYER_STATE1_CLIMBING_LEDGE | PLAYER_STATE1_HANGING_OFF_LEDGE |
+                         PLAYER_STATE1_CLIMBING_LADDER | PLAYER_STATE1_DAMAGED | PLAYER_STATE1_FIRST_PERSON |
+                         PLAYER_STATE1_CARRYING_ACTOR | PLAYER_STATE1_USING_BOOMERANG |
+                         PLAYER_STATE1_HOOKSHOT_FALLING | PLAYER_STATE1_LOADING | PLAYER_STATE1_FLOOR_DISABLED |
+                         PLAYER_STATE1_READY_TO_FIRE | PLAYER_STATE1_SHIELDING |
+                         PLAYER_STATE1_START_CHANGING_HELD_ITEM;
+    const u32 blocked2 = PLAYER_STATE2_UNDERWATER | PLAYER_STATE2_DIVING | PLAYER_STATE2_CRAWLING |
+                         PLAYER_STATE2_GRABBED_BY_ENEMY | PLAYER_STATE2_FROZEN | PLAYER_STATE2_OCARINA_PLAYING |
+                         PLAYER_STATE2_STATIONARY_LADDER;
+    if ((player->stateFlags1 & blocked1) || (player->stateFlags2 & blocked2)) {
+        return true;
+    }
+    return player->meleeWeaponState != 0;
+}
+
+// Standing, walking or running freely on the ground (not Z-targeting, rolling, swinging or anything else).
+bool FreeMovementAction(Player* player) {
+    const auto action = player->actionFunc;
+    return action == Player_Action_Idle || action == Player_Action_80840450 || action == Player_Action_808407CC ||
+           action == Player_Action_80840DE4 || action == Player_Action_808414F8 || action == Player_Action_8084170C ||
+           action == Player_Action_808417FC || action == Player_Action_80842180;
+}
+
+float TargetSpeed() {
+    const float speed = std::max(0.0f, CVarGetFloat(kCvarSpeed, 13.0f));
+    return IsChild() ? speed * kChildSpeedScale : speed;
+}
+
+void BeginBoost(Player* player) {
+    if (!sAssetsTried) {
+        LoadAssets();
+    }
+    sState = State::Active;
+    sInStart = CVarGetInteger(kCvarAnimation, 1) != 0 && HavePoses();
+    sAnimT = sInStart ? 0.0f : static_cast<float>(sMorphFrames);
+    sBoostSpeed = player->linearVelocity;
+    sWeight = 0.0f;
+    sAirFrames = 0;
+    sStuckCount = 0;
+    sNeutralCount = 0;
+    sFadeOut = 0;
+    sHavePose = false;
+    sLastX = player->actor.world.pos.x;
+    sLastZ = player->actor.world.pos.z;
+}
+
+// fade: blend the pose out over a few frames (false = it disappears at once).
+void EndBoost(bool fade) {
+    if (sState == State::Idle) {
+        return;
+    }
+    sState = State::Idle;
+    sInStart = false;
+    sFadeWeight = sWeight;
+    sFadeOut = (fade && sHavePose && sWeight > 0.05f) ? kFadeOutFrames : 0;
+}
+
+void ResetBoost() {
+    EndBoost(false);
+    sFadeOut = 0;
+    sHavePose = false;
+    sWeight = 0.0f;
+    sPolledDown = false;
+    sPressPending = false;
+}
+
+void RestoreHiddenButtons() {
+    if (!sInputHidden) {
+        return;
+    }
+    sInputHidden = false;
+    if (gPlayState == nullptr) {
+        return;
+    }
+    Input* input = &gPlayState->state.input[0];
+    input->cur.button |= sHiddenCur;
+    input->press.button |= sHiddenPress;
+}
+
+// Runs right before an actor updates. For Link: hide the sword button while X is held, so a boost is not a sword swing.
+void ShouldActorUpdateBoost(void* refActor, bool*) {
+    if (gPlayState == nullptr || refActor == nullptr || !CVarGetInteger(kCvarEnabled, 1)) {
+        return;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    if (player == nullptr || static_cast<Actor*>(refActor) != &player->actor) {
+        return;
+    }
+    const int block = CVarGetInteger(kCvarBlock, BTN_B);
+    if (block == 0) {
+        return;
+    }
+    // Looks at the button right now (not at the last game frame), so the very first frame of a press is covered too.
+    EnsureWatch();
+    Input* input = &gPlayState->state.input[0];
+    const int n64Button = CVarGetInteger(kCvarN64Button, 0);
+    const bool held = AnyControllerHolds(CVarGetInteger(kCvarSdlButton, SDL_CONTROLLER_BUTTON_X)) ||
+                      (sPressPending.load() && SDL_GetTicks() - sPressTick.load() <= kPressLifetimeMs) ||
+                      (n64Button != 0 && CHECK_BTN_ANY(input->cur.button, n64Button));
+    if (!held) {
+        return;
+    }
+    sHiddenCur = static_cast<u16>(input->cur.button & block);
+    sHiddenPress = static_cast<u16>(input->press.button & block);
+    input->cur.button &= ~block;
+    input->press.button &= ~block;
+    sInputHidden = true;
+}
+
+float Approach(float value, float target, float step) {
+    if (value < target) {
+        return std::min(target, value + step);
+    }
+    return std::max(target, value - step);
+}
+
+void OnPlayerUpdateBoost() {
+    if (gPlayState == nullptr) {
+        return;
+    }
+    RestoreHiddenButtons();
+    const bool pressed = ReadButton(); // always read, so old presses never pile up
+
+    if (!CVarGetInteger(kCvarEnabled, 1)) {
+        EndBoost(false);
+        sFadeOut = 0;
+        return;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    if (player == nullptr) {
+        return;
+    }
+    const bool onGround = (player->actor.bgCheckFlags & BGCHECKFLAG_GROUND) != 0;
+    const bool toggleMode = CVarGetInteger(kCvarMode, 0) != 0;
+
+    // ----- not boosting: wait for the button -----
+    if (sState == State::Idle) {
+        if (sFadeOut > 0) {
+            sFadeOut--;
+        }
+        if (pressed && onGround && !ChaosControlBusy() && !CannotBoost(player) && FreeMovementAction(player)) {
+            BeginBoost(player);
+        }
+        return;
+    }
+
+    // ----- boosting -----
+    if (ChaosControlBusy()) {
+        EndBoost(false);
+        return;
+    }
+    if (CannotBoost(player) || !FreeMovementAction(player)) {
+        EndBoost(true);
+        return;
+    }
+    if (toggleMode ? pressed : !sHeld) {
+        EndBoost(true);
+        return;
+    }
+    if (onGround) {
+        sAirFrames = 0;
+    } else if (++sAirFrames >= kMaxAirFrames) {
+        EndBoost(true);
+        return;
+    }
+
+    // Animation clock. The start animation is the crouch followed by a short morph into the run; the run loops.
+    if (sInStart) {
+        sAnimT += static_cast<float>(std::max(10, CVarGetInteger(kCvarStartRate, 100))) / 100.0f;
+        const AnimData& start = StartAnim();
+        if (sAnimT >= static_cast<float>(start.frames)) {
+            sAnimT = static_cast<float>(sMorphFrames) + (sAnimT - static_cast<float>(start.frames));
+            sInStart = false;
+        }
+    } else {
+        sAnimT += static_cast<float>(std::max(10, CVarGetInteger(kCvarRunRate, 100))) / 100.0f;
+        const float frames = static_cast<float>(std::max(1, LoopAnim().frames));
+        while (sAnimT >= frames) {
+            sAnimT -= frames;
+        }
+    }
+    const bool crouching = sInStart && sAnimT < static_cast<float>(sStartFrames);
+
+    // The stick: held, and which way (relative to the camera).
+    const Input& input = gPlayState->state.input[0];
+    const float stickX = static_cast<float>(input.cur.stick_x);
+    const float stickY = static_cast<float>(input.cur.stick_y);
+    const bool stickHeld = std::sqrt(stickX * stickX + stickY * stickY) >= kStickThreshold;
+    f32 speedTarget = 0.0f;
+    s16 yawTarget = 0;
+    Player_GetMovementSpeedAndYaw(player, &speedTarget, &yawTarget, 0.018f, gPlayState);
+    // The game brakes (and turns on the spot) when the stick points more than 135 degrees away from where Link runs.
+    const bool reversing = stickHeld && std::abs(static_cast<int>(static_cast<s16>(player->yaw - yawTarget))) > 0x6000;
+
+    // The speed. This runs after Link's own update; his movement next frame uses linearVelocity.
+    if (crouching) {
+        const float cap = std::max(0.0f, CVarGetFloat(kCvarCrouchSpeed, 2.0f));
+        if (player->linearVelocity > cap) {
+            player->linearVelocity = std::max(cap, player->linearVelocity - 2.5f);
+        }
+        sBoostSpeed = player->linearVelocity;
+        sStuckCount = 0;
+    } else if (stickHeld && !reversing) {
+        sBoostSpeed = Approach(sBoostSpeed, TargetSpeed(), std::max(0.1f, CVarGetFloat(kCvarAccel, 3.0f)));
+        player->linearVelocity = sBoostSpeed;
+
+        // Pushing against a wall: give up after a moment.
+        const float dx = player->actor.world.pos.x - sLastX;
+        const float dz = player->actor.world.pos.z - sLastZ;
+        const float moved = std::sqrt(dx * dx + dz * dz);
+        if (sBoostSpeed > 8.0f && moved < sBoostSpeed * 0.3f) {
+            if (++sStuckCount >= kStuckFrames) {
+                EndBoost(true);
+                return;
+            }
+        } else {
+            sStuckCount = 0;
+        }
+    } else {
+        // Stick let go or reversing: the game slows Link down (and turns him around).
+        sBoostSpeed = player->linearVelocity;
+        sStuckCount = 0;
+    }
+    sLastX = player->actor.world.pos.x;
+    sLastZ = player->actor.world.pos.z;
+
+    if (stickHeld) {
+        sNeutralCount = 0;
+    } else if (player->linearVelocity < 1.0f && ++sNeutralCount >= kNeutralFrames) {
+        EndBoost(true);
+        return;
+    }
+
+    // How much of the pose to show: the crouch always, the run once Link is moving fast.
+    const bool wantPose = sInStart || player->linearVelocity >= kPoseSpeed;
+    sWeight = Approach(sWeight, wantPose ? 1.0f : 0.0f, wantPose ? 0.5f : 0.34f);
+}
+
+// Runs right before the game draws the frame, after the game has put Link's normal pose into his joint table.
+void OnPlayDrawBeginBoost() {
+    if (gPlayState == nullptr) {
+        return;
+    }
+    const bool active = sState == State::Active;
+    const bool fading = !active && sFadeOut > 0 && sHavePose;
+    if (!active && !fading) {
+        return;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    if (player == nullptr || player->skelAnime.jointTable == nullptr) {
+        return;
+    }
+
+    Vec3s target[kJoints];
+    float weight;
+    if (active) {
+        if (CVarGetInteger(kCvarAnimation, 1) == 0 || !HavePoses() || sWeight <= 0.0f) {
+            return;
+        }
+        if (sInStart) {
+            SamplePose(StartAnim(), sAnimT, false, target);
+        } else {
+            SamplePose(LoopAnim(), sAnimT, true, target);
+        }
+        std::memcpy(sLastPose, target, sizeof(target));
+        sHavePose = true;
+        weight = sWeight;
+    } else {
+        std::memcpy(target, sLastPose, sizeof(target));
+        weight = sFadeWeight * static_cast<float>(sFadeOut) / static_cast<float>(kFadeOutFrames);
+    }
+    if (weight <= 0.0f) {
+        return;
+    }
+
+    const int joints = std::min<int>(kJoints, player->skelAnime.limbCount);
+    Vec3s* table = player->skelAnime.jointTable;
+    for (int j = 0; j < joints; j++) {
+        if (KeepGameLimb(j)) {
+            continue;
+        }
+        if (j == 0) { // root position
+            table[j].x = LerpS16(table[j].x, target[j].x, weight);
+            table[j].y = LerpS16(table[j].y, target[j].y, weight);
+            table[j].z = LerpS16(table[j].z, target[j].z, weight);
+        } else { // limb rotations
+            table[j].x = LerpAngle(table[j].x, target[j].x, weight);
+            table[j].y = LerpAngle(table[j].y, target[j].y, weight);
+            table[j].z = LerpAngle(table[j].z, target[j].z, weight);
+        }
+    }
+}
+
+void RegisterBoost() {
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayerUpdate>(OnPlayerUpdateBoost);
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::ShouldActorUpdate>(ShouldActorUpdateBoost);
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayDrawBegin>(OnPlayDrawBeginBoost);
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnSceneInit>([](int16_t) { ResetBoost(); });
+    // The pause menu does not run player updates, so end the boost when it opens.
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnKaleidoscopeUpdate>([](int16_t) { ResetBoost(); });
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnLoadGame>([](int32_t) {
+        ResetBoost();
+        LoadAssets();
+    });
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnExitGame>([](int32_t) { ResetBoost(); });
+}
+
+static RegisterShipInitFunc sBoostInit(RegisterBoost);
+
+} // namespace
