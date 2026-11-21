@@ -1,10 +1,16 @@
-// Shadow the Hedgehog - Jump and Double Jump for Ship of Harkinian 9.3.1
+// Shadow the Hedgehog - Jump, Double Jump and carrying things for Ship of Harkinian 9.3.1
 //
 // Ocarina of Time has no jump button. This adds one: the Y button.
 //   * Y while standing, walking or running on the ground: Shadow jumps, in his SA2 jump pose (animation 116, a tucked jump).
 //   * Y again while in the air: a second jump, in his SA2 flip (animation 114). One extra jump per time in the air;
 //     touching the ground gives it back. Y works during Chaos Control once time has stopped.
 //   Walking off a ledge or jumping with the A button still uses the game's own jump and fall animations.
+//
+// Carrying (this file also fixes two things that show up when Shadow carries something, Princess Ruto for instance):
+//   * Ruto sat inside Shadow's head. The game puts a carried actor halfway between Link's two hands, and Shadow's hands
+//     are at head height. Ruto is now moved up and forward (a few game units, see the settings below).
+//   * Jumping or falling while carrying: the game plays the carry animation on the upper body, so the legs did the jump
+//     and the chest and head stayed upright. The chest and head now follow the jump animation; the arms keep holding.
 //   The two poses are put onto Link's skeleton while the game draws him (like the boost and Chaos Control poses); they
 //   are inside chaos_control_audio.o2r (custom/jump/*). Without them the jumps still work, with the game's jump animation.
 // The press is read straight from the game controller (SDL), so it works whatever the N64 buttons are mapped to.
@@ -27,11 +33,21 @@
 //   gShadow.Jump.FirstRate       playback speed of the first jump pose in percent, default 0 = automatic (the pose
 //                                is sped up so that it lasts as long as the jump)
 //   gShadow.Jump.SecondRate      the same for the flip, default 0 = automatic
+//   gShadow.Status               1 = after a save has loaded, show which Shadow files are in the build (default), 0 = off
+//   gShadow.Carry.Enabled        1 = the carrying fixes are on (default), 0 = off
+//   gShadow.Carry.Up             how far Ruto is moved up, in game units (default 10; Link is about 48 units tall as a child)
+//   gShadow.Carry.Forward        how far Ruto is moved forward, in game units (default 4)
+//   gShadow.Carry.Side           how far Ruto is moved to Shadow's right, in game units (default 0)
+//   gShadow.Carry.Actors         0 = only Ruto is moved (default), 1 = everything that is carried
+//   gShadow.Carry.JumpFollow     1 = chest and head follow the jump while carrying (default), 0 = the game's way
+//   The three offsets can also be set without rebuilding: a mod file with custom/carry/config.txt (up=, forward=, side=,
+//   one per line) overrides the defaults. A setting changed in the console beats the file.
 
 #include <libultraship/bridge/consolevariablebridge.h>
 
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
 #include "soh/ShipInit.hpp"
+#include "soh/Notification/Notification.h"
 
 #include <SDL2/SDL.h>
 #include <ship/Context.h>
@@ -78,6 +94,12 @@ void Player_Action_808417FC(Player* player, PlayState* play);
 // Provided by ChaosControl.cpp. True while Chaos Control holds Link still. Weak, so this file also works without it.
 extern "C" __attribute__((weak)) bool ShadowChaosControl_IsBusy(void);
 
+// Version numbers that Boost.cpp, ChestJingle.cpp and ChaosControl.cpp define (see the end of each file). Weak, so a file that
+// is missing from the build, or an old version of it, simply reads as 0. Used by the status report on load.
+extern "C" __attribute__((weak)) int ShadowAbilityVersion_Boost;
+extern "C" __attribute__((weak)) int ShadowAbilityVersion_ChestJingle;
+extern "C" __attribute__((weak)) int ShadowAbilityVersion_ChaosControl;
+
 namespace {
 
 constexpr const char* kCvarEnabled = "gShadow.Jump.Enabled";
@@ -91,6 +113,13 @@ constexpr const char* kCvarBoost = "gShadow.Jump.Boost";
 constexpr const char* kCvarAnimation = "gShadow.Jump.Animation";
 constexpr const char* kCvarFirstRate = "gShadow.Jump.FirstRate";
 constexpr const char* kCvarSecondRate = "gShadow.Jump.SecondRate";
+constexpr const char* kCvarCarryEnabled = "gShadow.Carry.Enabled";
+constexpr const char* kCvarCarryUp = "gShadow.Carry.Up";
+constexpr const char* kCvarCarryForward = "gShadow.Carry.Forward";
+constexpr const char* kCvarCarrySide = "gShadow.Carry.Side";
+constexpr const char* kCvarCarryActors = "gShadow.Carry.Actors";
+constexpr const char* kCvarCarryJumpFollow = "gShadow.Carry.JumpFollow";
+constexpr const char* kFileCarryConfig = "custom/carry/config.txt";
 
 constexpr const char* kFileFirstAdult = "custom/jump/anim_jump1_adult.bin";
 constexpr const char* kFileFirstChild = "custom/jump/anim_jump1_child.bin";
@@ -588,9 +617,261 @@ void OnPlayDrawBeginJump() {
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// Carrying things
+// ------------------------------------------------------------------------------------------------
+
+// 1. Where the carried actor sits. While Link draws, the game puts the carried actor halfway between his two hands
+//    (the right hand's position and Player::leftHandPos). The hook below runs just before that happens and moves both
+//    hand positions, so the carried actor ends up moved by the same amount. The positions are rebuilt by the game at
+//    every draw, and are put back at the end of the draw anyway.
+
+constexpr float kDefaultCarryUp = 10.0f;
+constexpr float kDefaultCarryForward = 4.0f;
+constexpr float kDefaultCarrySide = 0.0f;
+constexpr float kNoCvar = 12345.0f;
+constexpr int kRightHandBodyPart = PLAYER_BODYPART_R_HAND; // the game averages this hand with the left one (index 15)
+constexpr int kUpperLimb = 9;          // joint table index of the chest (PLAYER_LIMB_UPPER - 1)
+constexpr int kHeadLimb = 10;          // joint table index of the head (PLAYER_LIMB_HEAD - 1)
+
+float sCfgUp = kDefaultCarryUp;
+float sCfgForward = kDefaultCarryForward;
+float sCfgSide = kDefaultCarrySide;
+bool sCarryConfigTried = false;
+
+void LoadCarryConfig() {
+    if (sCarryConfigTried) {
+        return;
+    }
+    sCarryConfigTried = true;
+    auto file = LoadModFile(kFileCarryConfig);
+    if (file == nullptr) {
+        return;
+    }
+    const std::string text(file->Buffer->begin(), file->Buffer->end());
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find('\n', pos);
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        const std::string line = text.substr(pos, end - pos);
+        pos = end + 1;
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        const std::string key = line.substr(0, eq);
+        const float value = static_cast<float>(std::atof(line.c_str() + eq + 1));
+        if (key == "up") {
+            sCfgUp = value;
+        } else if (key == "forward") {
+            sCfgForward = value;
+        } else if (key == "side") {
+            sCfgSide = value;
+        }
+    }
+}
+
+// The console's "set" stores a whole number (12) as an integer and a number with a point (12.5) as a float, and each
+// getter only sees its own kind, so both are looked at.
+float CarrySetting(const char* cvar, float fromFile) {
+    const float v = CVarGetFloat(cvar, kNoCvar);
+    if (v != kNoCvar) {
+        return v;
+    }
+    const int32_t i = CVarGetInteger(cvar, INT32_MIN);
+    return i == INT32_MIN ? fromFile : static_cast<float>(i);
+}
+
+bool IsMovedActor(const Actor* held) {
+    if (CVarGetInteger(kCvarCarryActors, 0) != 0) {
+        return true;
+    }
+    return held->id == ACTOR_EN_RU1 || held->id == ACTOR_EN_RU2; // Princess Ruto
+}
+
+Vec3f sSavedLeftHand;
+Vec3f sSavedRightHand;
+bool sHandsShifted = false;
+
+void OnDrawHandsCarry(Player* player) {
+    if (player == nullptr || !CVarGetInteger(kCvarCarryEnabled, 1) ||
+        !(player->stateFlags1 & PLAYER_STATE1_CARRYING_ACTOR) || player->heldActor == nullptr ||
+        !IsMovedActor(player->heldActor)) {
+        return;
+    }
+    if (!sCarryConfigTried) {
+        LoadCarryConfig();
+    }
+    const float up = CarrySetting(kCvarCarryUp, sCfgUp);
+    const float forward = CarrySetting(kCvarCarryForward, sCfgForward);
+    const float side = CarrySetting(kCvarCarrySide, sCfgSide);
+    if (up == 0.0f && forward == 0.0f && side == 0.0f) {
+        return;
+    }
+    // Link faces +Z at yaw 0, so forward is (sin, cos); his right is (-cos, sin).
+    const float yaw = static_cast<float>(player->actor.shape.rot.y) * (3.14159265f / 32768.0f);
+    const float dx = forward * std::sin(yaw) - side * std::cos(yaw);
+    const float dz = forward * std::cos(yaw) + side * std::sin(yaw);
+
+    sSavedLeftHand = player->leftHandPos;
+    sSavedRightHand = player->bodyPartsPos[kRightHandBodyPart];
+    sHandsShifted = true;
+    player->leftHandPos.x += dx;
+    player->leftHandPos.y += up;
+    player->leftHandPos.z += dz;
+    player->bodyPartsPos[kRightHandBodyPart].x += dx;
+    player->bodyPartsPos[kRightHandBodyPart].y += up;
+    player->bodyPartsPos[kRightHandBodyPart].z += dz;
+}
+
+// After the world has been drawn: the hand positions go back to what the game worked out (other code uses them).
+void OnPlayDrawEndCarry() {
+    if (!sHandsShifted) {
+        return;
+    }
+    sHandsShifted = false;
+    if (gPlayState == nullptr) {
+        return;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    if (player == nullptr) {
+        return;
+    }
+    player->leftHandPos = sSavedLeftHand;
+    player->bodyPartsPos[kRightHandBodyPart] = sSavedRightHand;
+}
+
+// 2. Jumping while carrying. The upper body animation (carrying) is copied over the chest, head and arms of the
+//    main skeleton after the jump animation has been loaded, so only the legs showed the jump. At the end of the
+//    player update the main skeleton still holds the jump animation's chest and head, so those are saved here and put
+//    back when the frame is drawn. The arms keep the carry animation, so Shadow keeps holding on.
+
+Vec3s sJumpChest[2];      // chest and head rotations of the jump animation
+float sJumpFollow = 0.0f; // 0..1 how much of the jump animation the chest and head get
+
+void OnPlayerUpdateCarry() {
+    if (gPlayState == nullptr) {
+        return;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    if (player == nullptr || player->skelAnime.jointTable == nullptr || player->skelAnime.limbCount <= kHeadLimb) {
+        sJumpFollow = 0.0f;
+        return;
+    }
+    const bool want = CVarGetInteger(kCvarCarryEnabled, 1) != 0 && CVarGetInteger(kCvarCarryJumpFollow, 1) != 0 &&
+                      (player->stateFlags1 & PLAYER_STATE1_CARRYING_ACTOR) && player->heldActor != nullptr &&
+                      !(player->actor.bgCheckFlags & BGCHECKFLAG_GROUND) &&
+                      player->actionFunc == Player_Action_8084411C;
+    if (want) {
+        sJumpChest[0] = player->skelAnime.jointTable[kUpperLimb];
+        sJumpChest[1] = player->skelAnime.jointTable[kHeadLimb];
+    }
+    sJumpFollow = Approach(sJumpFollow, want ? 1.0f : 0.0f, want ? 0.5f : 0.34f);
+}
+
+void OnPlayDrawBeginCarry() {
+    if (gPlayState == nullptr || sJumpFollow <= 0.0f) {
+        return;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    if (player == nullptr || player->skelAnime.jointTable == nullptr || player->skelAnime.limbCount <= kHeadLimb) {
+        return;
+    }
+    Vec3s* table = player->skelAnime.jointTable;
+    const int limbs[2] = { kUpperLimb, kHeadLimb };
+    for (int i = 0; i < 2; i++) {
+        Vec3s& t = table[limbs[i]];
+        t.x = LerpAngle(t.x, sJumpChest[i].x, sJumpFollow);
+        t.y = LerpAngle(t.y, sJumpChest[i].y, sJumpFollow);
+        t.z = LerpAngle(t.z, sJumpChest[i].z, sJumpFollow);
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Status report. This file is the one that is known to be in the build, so it tells you which of the other files are in it.
+// A few seconds after a save has loaded (a message that is shown during the loading screen is gone before the game starts),
+// one small message per ability appears at the bottom right and stays for 12 seconds. "Shadow Boost: NOT in this build"
+// means Boost.cpp is missing from the branch or is an old version of the file; the same goes for the others.
+// gShadow.Status 0 turns the report off.
+// ------------------------------------------------------------------------------------------------
+
+constexpr int kJumpVersion = 3;
+constexpr const char* kCvarStatus = "gShadow.Status";
+constexpr int kStatusDelayFrames = 40; // game frames of play after the load (2 seconds)
+
+bool sStatusPending = false;
+int sStatusFrames = 0;
+
+int VersionOf(const int* version) {
+    return version != nullptr ? *version : 0;
+}
+
+bool ModFileExists(const char* path) {
+    Ship::Context* ctx = Ship::Context::GetRawInstance();
+    if (ctx == nullptr || ctx->GetResourceManager() == nullptr) {
+        return false;
+    }
+    auto archiveManager = ctx->GetResourceManager()->GetArchiveManager();
+    return archiveManager != nullptr && archiveManager->HasFile(path);
+}
+
+void SayStatus(const std::string& text) {
+    Notification::Emit({ .message = text, .remainingTime = 12.0f, .mute = true });
+}
+
+void ReportStatus() {
+    const int boost = VersionOf(&ShadowAbilityVersion_Boost);
+    const int chest = VersionOf(&ShadowAbilityVersion_ChestJingle);
+    const int chaos = VersionOf(&ShadowAbilityVersion_ChaosControl);
+
+    SayStatus(std::string("Shadow Jump v") + std::to_string(kJumpVersion) + ": OK, " +
+              (sFirstAdult.frames > 0 && sSecondAdult.frames > 0 ? "poses found" : "poses NOT found"));
+    if (boost > 0) {
+        SayStatus(std::string("Shadow Boost v") + std::to_string(boost) + ": OK, " +
+                  (ModFileExists("custom/boost/anim_start_adult.bin") ? "poses found" : "poses NOT found"));
+    } else {
+        SayStatus("Shadow Boost: NOT in this build (Boost.cpp missing or old)");
+    }
+    if (chest > 0) {
+        SayStatus(std::string("Shadow Chest jingle v") + std::to_string(chest) + ": OK, " +
+                  (ModFileExists("custom/chest_jingle/jingle.wav") ? "tune found" : "tune NOT found"));
+    } else {
+        SayStatus("Shadow Chest jingle: NOT in this build (ChestJingle.cpp missing or old)");
+    }
+    if (chaos > 0) {
+        SayStatus(std::string("Shadow Chaos Control v") + std::to_string(chaos) + ": OK");
+    } else {
+        SayStatus("Shadow Chaos Control: old version (ChaosControl.cpp)");
+    }
+}
+
+void OnPlayerUpdateStatus() {
+    if (!sStatusPending) {
+        return;
+    }
+    if (++sStatusFrames < kStatusDelayFrames) {
+        return;
+    }
+    sStatusPending = false;
+    if (CVarGetInteger(kCvarStatus, 1) != 0) {
+        ReportStatus();
+    }
+}
+
 void RegisterJump() {
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayerUpdate>(OnPlayerUpdateJump);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayDrawBegin>(OnPlayDrawBeginJump);
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayerUpdate>(OnPlayerUpdateCarry);
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayerUpdate>(OnPlayerUpdateStatus);
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayDrawBegin>(OnPlayDrawBeginCarry);
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayDrawEnd>(OnPlayDrawEndCarry);
+    // The game asks this while it draws Link's right hand, just before it puts a carried actor between his hands.
+    REGISTER_VB_SHOULD(VB_DRAW_ADDITIONAL_RETICLES, {
+        (void)should;
+        OnDrawHandsCarry(va_arg(args, Player*));
+    });
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnSceneInit>([](int16_t) {
         sAirFrames = 0;
         sJumpsLeft = 0;
@@ -601,6 +882,11 @@ void RegisterJump() {
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnLoadGame>([](int32_t) {
         ResetPose();
         LoadAssets();
+        sCarryConfigTried = false; // read custom/carry/config.txt again
+        LoadCarryConfig();
+        sJumpFollow = 0.0f;
+        sStatusPending = true; // the status report comes once the game is running
+        sStatusFrames = 0;
     });
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnExitGame>([](int32_t) { ResetPose(); });
 }
@@ -608,3 +894,7 @@ void RegisterJump() {
 static RegisterShipInitFunc sJumpInit(RegisterJump);
 
 } // namespace
+
+extern "C" {
+int ShadowAbilityVersion_Jump = 3;
+}
