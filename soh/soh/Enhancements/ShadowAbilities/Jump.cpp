@@ -40,6 +40,7 @@
 //   gShadow.Carry.Side           how far Ruto is moved to Shadow's right, in game units (default 0)
 //   gShadow.Carry.Actors         0 = only Ruto is moved (default), 1 = everything that is carried
 //   gShadow.Carry.JumpFollow     1 = chest and head follow the jump while carrying (default), 0 = the game's way
+//   gShadow.Carry.Anchor         1 = a carried Ruto is kept at Shadow's hands during the updates too (default), 0 = the game's way
 //   The three offsets can also be set without rebuilding: a mod file with custom/carry/config.txt (up=, forward=, side=,
 //   one per line) overrides the defaults. A setting changed in the console beats the file.
 
@@ -97,6 +98,7 @@ extern "C" __attribute__((weak)) bool ShadowChaosControl_IsBusy(void);
 // Version numbers that Boost.cpp, ChestJingle.cpp and ChaosControl.cpp define (see the end of each file). Weak, so a file that
 // is missing from the build, or an old version of it, simply reads as 0. Used by the status report on load.
 extern "C" __attribute__((weak)) int ShadowAbilityVersion_Boost;
+extern "C" __attribute__((weak)) bool ShadowBoost_IsBusy(void); // Boost.cpp: true while its charge-up pose plays
 extern "C" __attribute__((weak)) int ShadowAbilityVersion_ChestJingle;
 extern "C" __attribute__((weak)) int ShadowAbilityVersion_ChaosControl;
 
@@ -119,6 +121,7 @@ constexpr const char* kCvarCarryForward = "gShadow.Carry.Forward";
 constexpr const char* kCvarCarrySide = "gShadow.Carry.Side";
 constexpr const char* kCvarCarryActors = "gShadow.Carry.Actors";
 constexpr const char* kCvarCarryJumpFollow = "gShadow.Carry.JumpFollow";
+constexpr const char* kCvarCarryAnchor = "gShadow.Carry.Anchor";
 constexpr const char* kFileCarryConfig = "custom/carry/config.txt";
 
 constexpr const char* kFileFirstAdult = "custom/jump/anim_jump1_adult.bin";
@@ -202,8 +205,10 @@ bool JumpPressed() {
 int sAirFrames = 0; // game frames since Link left the ground
 int sJumpsLeft = 0; // air jumps still available in this stay in the air
 
+// True while Chaos Control's start pose or the boost's charge-up pose holds Link still (Y must not break out of them).
 bool ChaosControlBusy() {
-    return ShadowChaosControl_IsBusy != nullptr && ShadowChaosControl_IsBusy();
+    return (ShadowChaosControl_IsBusy != nullptr && ShadowChaosControl_IsBusy()) ||
+           (ShadowBoost_IsBusy != nullptr && ShadowBoost_IsBusy());
 }
 
 // True when Link is not in control or is in a state where a jump makes no sense.
@@ -695,6 +700,11 @@ Vec3f sSavedLeftHand;
 Vec3f sSavedRightHand;
 bool sHandsShifted = false;
 
+// Where the game put the carried actor (relative to Link) the last time he was drawn, and which way he faced.
+Vec3f sCarryOffset = { 0.0f, 0.0f, 0.0f };
+int16_t sCarryYaw = 0;
+bool sCarryOffsetValid = false;
+
 void OnDrawHandsCarry(Player* player) {
     if (player == nullptr || !CVarGetInteger(kCvarCarryEnabled, 1) ||
         !(player->stateFlags1 & PLAYER_STATE1_CARRYING_ACTOR) || player->heldActor == nullptr ||
@@ -707,23 +717,28 @@ void OnDrawHandsCarry(Player* player) {
     const float up = CarrySetting(kCvarCarryUp, sCfgUp);
     const float forward = CarrySetting(kCvarCarryForward, sCfgForward);
     const float side = CarrySetting(kCvarCarrySide, sCfgSide);
-    if (up == 0.0f && forward == 0.0f && side == 0.0f) {
-        return;
-    }
-    // Link faces +Z at yaw 0, so forward is (sin, cos); his right is (-cos, sin).
-    const float yaw = static_cast<float>(player->actor.shape.rot.y) * (3.14159265f / 32768.0f);
-    const float dx = forward * std::sin(yaw) - side * std::cos(yaw);
-    const float dz = forward * std::cos(yaw) + side * std::sin(yaw);
+    if (!(up == 0.0f && forward == 0.0f && side == 0.0f)) {
+        // Link faces +Z at yaw 0, so forward is (sin, cos); his right is (-cos, sin).
+        const float yaw = static_cast<float>(player->actor.shape.rot.y) * (3.14159265f / 32768.0f);
+        const float dx = forward * std::sin(yaw) - side * std::cos(yaw);
+        const float dz = forward * std::cos(yaw) + side * std::sin(yaw);
 
-    sSavedLeftHand = player->leftHandPos;
-    sSavedRightHand = player->bodyPartsPos[kRightHandBodyPart];
-    sHandsShifted = true;
-    player->leftHandPos.x += dx;
-    player->leftHandPos.y += up;
-    player->leftHandPos.z += dz;
-    player->bodyPartsPos[kRightHandBodyPart].x += dx;
-    player->bodyPartsPos[kRightHandBodyPart].y += up;
-    player->bodyPartsPos[kRightHandBodyPart].z += dz;
+        sSavedLeftHand = player->leftHandPos;
+        sSavedRightHand = player->bodyPartsPos[kRightHandBodyPart];
+        sHandsShifted = true;
+        player->leftHandPos.x += dx;
+        player->leftHandPos.y += up;
+        player->leftHandPos.z += dz;
+        player->bodyPartsPos[kRightHandBodyPart].x += dx;
+        player->bodyPartsPos[kRightHandBodyPart].y += up;
+        player->bodyPartsPos[kRightHandBodyPart].z += dz;
+    }
+    // Where the game is about to put the carried actor, relative to Link. Used to keep the actor with him during the updates.
+    sCarryOffset.x = (player->leftHandPos.x + player->bodyPartsPos[kRightHandBodyPart].x) * 0.5f - player->actor.world.pos.x;
+    sCarryOffset.y = (player->leftHandPos.y + player->bodyPartsPos[kRightHandBodyPart].y) * 0.5f - player->actor.world.pos.y;
+    sCarryOffset.z = (player->leftHandPos.z + player->bodyPartsPos[kRightHandBodyPart].z) * 0.5f - player->actor.world.pos.z;
+    sCarryYaw = player->actor.shape.rot.y;
+    sCarryOffsetValid = true;
 }
 
 // After the world has been drawn: the hand positions go back to what the game worked out (other code uses them).
@@ -743,6 +758,44 @@ void OnPlayDrawEndCarry() {
     player->bodyPartsPos[kRightHandBodyPart] = sSavedRightHand;
 }
 
+// 1b. Keeping a carried Ruto with Shadow. The game only puts the carried actor between Link's hands while it draws him.
+//     In between (the updates, which is also when a throw starts) the actor stays wherever it was. Reported Nov 21: Ruto
+//     trailed behind while Shadow walked and a throw started from where she was, not from Shadow. So the actor is moved
+//     to Link's position plus the offset the game used at the last draw, right after the player update and again right
+//     after the actor's own update. The game's own placement at the next draw still has the last word.
+
+bool KeepsHeldActor(Player* player, const Actor* actor) {
+    return player != nullptr && actor != nullptr && CVarGetInteger(kCvarCarryEnabled, 1) != 0 &&
+           CVarGetInteger(kCvarCarryAnchor, 1) != 0 && (player->stateFlags1 & PLAYER_STATE1_CARRYING_ACTOR) &&
+           player->heldActor == actor && IsMovedActor(actor) && sCarryOffsetValid;
+}
+
+void AnchorHeldActor(Player* player) {
+    Actor* held = player->heldActor;
+    if (!KeepsHeldActor(player, held)) {
+        return;
+    }
+    // The offset is turned along with Link if he has turned since the last draw (forward is (sin, cos)).
+    const float turn = static_cast<float>(static_cast<int16_t>(player->actor.shape.rot.y - sCarryYaw)) * (3.14159265f / 32768.0f);
+    const float c = std::cos(turn);
+    const float s = std::sin(turn);
+    const float ox = sCarryOffset.x * c + sCarryOffset.z * s;
+    const float oz = sCarryOffset.z * c - sCarryOffset.x * s;
+    held->world.pos.x = player->actor.world.pos.x + ox;
+    held->world.pos.y = player->actor.world.pos.y + sCarryOffset.y;
+    held->world.pos.z = player->actor.world.pos.z + oz;
+}
+
+void OnActorUpdateCarry(void* actor) {
+    if (gPlayState == nullptr || actor == nullptr) {
+        return;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    if (player != nullptr && player->heldActor == static_cast<Actor*>(actor)) {
+        AnchorHeldActor(player);
+    }
+}
+
 // 2. Jumping while carrying. The upper body animation (carrying) is copied over the chest, head and arms of the
 //    main skeleton after the jump animation has been loaded, so only the legs showed the jump. At the end of the
 //    player update the main skeleton still holds the jump animation's chest and head, so those are saved here and put
@@ -756,6 +809,13 @@ void OnPlayerUpdateCarry() {
         return;
     }
     Player* player = GET_PLAYER(gPlayState);
+    if (player != nullptr) {
+        if (!(player->stateFlags1 & PLAYER_STATE1_CARRYING_ACTOR) || player->heldActor == nullptr) {
+            sCarryOffsetValid = false; // nothing carried: the next carry starts from the game's own placement
+        } else {
+            AnchorHeldActor(player);
+        }
+    }
     if (player == nullptr || player->skelAnime.jointTable == nullptr || player->skelAnime.limbCount <= kHeadLimb) {
         sJumpFollow = 0.0f;
         return;
@@ -797,7 +857,7 @@ void OnPlayDrawBeginCarry() {
 // gShadow.Status 0 turns the report off.
 // ------------------------------------------------------------------------------------------------
 
-constexpr int kJumpVersion = 3;
+constexpr int kJumpVersion = 5;
 constexpr const char* kCvarStatus = "gShadow.Status";
 constexpr int kStatusDelayFrames = 40; // game frames of play after the load (2 seconds)
 
@@ -830,7 +890,8 @@ void ReportStatus() {
               (sFirstAdult.frames > 0 && sSecondAdult.frames > 0 ? "poses found" : "poses NOT found"));
     if (boost > 0) {
         SayStatus(std::string("Shadow Boost v") + std::to_string(boost) + ": OK, " +
-                  (ModFileExists("custom/boost/anim_start_adult.bin") ? "poses found" : "poses NOT found"));
+                  (ModFileExists("custom/boost/anim_run_adult.bin") ? "poses found, " : "poses NOT found, ") +
+                  (ModFileExists("custom/boost/music.wav") ? "tune found" : "tune NOT found"));
     } else {
         SayStatus("Shadow Boost: NOT in this build (Boost.cpp missing or old)");
     }
@@ -867,6 +928,7 @@ void RegisterJump() {
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayerUpdate>(OnPlayerUpdateStatus);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayDrawBegin>(OnPlayDrawBeginCarry);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayDrawEnd>(OnPlayDrawEndCarry);
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnActorUpdate>(OnActorUpdateCarry);
     // The game asks this while it draws Link's right hand, just before it puts a carried actor between his hands.
     REGISTER_VB_SHOULD(VB_DRAW_ADDITIONAL_RETICLES, {
         (void)should;
