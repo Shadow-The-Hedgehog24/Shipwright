@@ -309,8 +309,6 @@ void RegisterChestJingle() {
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayerUpdate>(OnPlayerUpdateChestJingle);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnLoadGame>([](int32_t) {
         LoadJingle();
-        Say(sReady ? "Shadow chest jingle ready (tune loaded)"
-                   : "Shadow chest jingle code is here, but the tune was NOT found (chaos_control_audio.o2r)");
     });
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnSceneInit>([](int16_t) {
         LoadJingle();
@@ -325,3 +323,8 @@ void RegisterChestJingle() {
 static RegisterShipInitFunc sChestJingleInit(RegisterChestJingle);
 
 } // namespace
+
+// Read by the status report in Jump.cpp: tells it that this file is in the build, and which version it is.
+extern "C" {
+int ShadowAbilityVersion_ChestJingle = 2;
+}
