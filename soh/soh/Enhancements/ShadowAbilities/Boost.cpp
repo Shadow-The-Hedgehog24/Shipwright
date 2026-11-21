@@ -1418,11 +1418,11 @@ void FxReset() {
     sPulse = 0.0f;
     sDropAge = -2;
     sGrayOn = false; // sGrayWasOn stays, so the next frame switches the greyscale off in the display lists
-    if (gPlayState != nullptr) {
-        if (Player* player = GET_PLAYER(gPlayState)) {
-            SetDrawWrapper(player, false);
-        }
-    }
+    // Deliberately does NOT touch the player actor. This runs from the scene init hook, which the game calls before it has
+    // set up the actor lists of the new play state (on the very first scene, the title screen, they hold garbage), and from
+    // the load and exit hooks, where the play state may already be gone. The draw wrapper needs no undoing here:
+    // FxDrawBegin puts the game's own draw function back on the next frame (the weight is 0 now, so nothing is wanted),
+    // and after a scene change the old player actor, and the wrapper in it, no longer exist.
 }
 
 // Loads the see-through skeleton ahead of time, so the first after image does not make the game hitch.
@@ -1855,5 +1855,5 @@ extern "C" bool ShadowBoost_IsBusy(void) {
 // 8 = works with the boomerang (and other items) in hand.
 // 9 = the "Boost blocked" message names the reason.
 extern "C" {
-int ShadowAbilityVersion_Boost = 9;
+int ShadowAbilityVersion_Boost = 10;
 }
