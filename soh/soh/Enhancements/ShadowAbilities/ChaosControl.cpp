@@ -972,6 +972,12 @@ extern "C" bool ShadowChaosControl_IsBusy(void) {
     return sState == State::Windup;
 }
 
+// Read by the status report in Jump.cpp: tells it that this file is in the build, and which version it is.
+// 2 = the version where Y and X work once time has stopped.
+extern "C" {
+int ShadowAbilityVersion_ChaosControl = 2;
+}
+
 // ----- The duration bar ---------------------------------------------------------------------------
 // Drawn with the same textures and the same drawing steps as the magic meter (Interface_DrawMagicBar), so it
 // looks like it belongs to the HUD.
