@@ -49,6 +49,9 @@
 //   gShadow.ChaosControl.SyncOffset   milliseconds the music is shifted against the pose, default 0. If the shout
 //                                     comes too early, set it positive; too late, negative
 //   gShadow.ChaosControl.Animation    1 = play the pose (default), 0 = no pose
+//   gShadow.ChaosControl.HitEnemies   1 = Shadow can hit frozen enemies (default), 0 = they cannot be hit
+//   gShadow.ChaosControl.PoseLift     extra height added to the pose in model units (100 = 1 game unit), default 0.
+//                                     The pose file already keeps the feet above the floor; use this only to fine-tune.
 //   gShadow.ChaosControl.Lock         1 = lock the player during the start (default), 0 = no lock
 //   gShadow.ChaosControl.Bar          1 = show the duration bar (default), 0 = hide it
 //   gShadow.ChaosControl.BarX/BarY    bar position, default 18 / 56 (320x240 screen units, from the left edge)
@@ -58,6 +61,7 @@
 
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
 #include "soh/Enhancements/randomizer/SeedContext.h"
+#include "soh/ActorDB.h"
 #include "soh/ShipInit.hpp"
 
 #include <SDL2/SDL.h>
@@ -102,6 +106,8 @@ constexpr const char* kCvarVolume = "gShadow.ChaosControl.Volume";
 constexpr const char* kCvarDropOffset = "gShadow.ChaosControl.DropOffset";
 constexpr const char* kCvarSyncOffset = "gShadow.ChaosControl.SyncOffset";
 constexpr const char* kCvarAnimation = "gShadow.ChaosControl.Animation";
+constexpr const char* kCvarPoseLift = "gShadow.ChaosControl.PoseLift";
+constexpr const char* kCvarHitEnemies = "gShadow.ChaosControl.HitEnemies";
 constexpr const char* kCvarLock = "gShadow.ChaosControl.Lock";
 constexpr const char* kCvarBar = "gShadow.ChaosControl.Bar";
 constexpr const char* kCvarBarX = "gShadow.ChaosControl.BarX";
@@ -430,6 +436,7 @@ void LoadAssets() {
 enum class State { Idle, Windup, Active };
 
 State sState = State::Idle;
+std::vector<Actor*> sThawed; // frozen enemies that were let through for one frame to take a hit
 int sActiveFrames = 0;      // frames of freeze left
 int sActiveTotal = 1;       // frames of freeze in total (for the bar)
 int sEndCueFrames = 0;      // the ending sound starts when sActiveFrames drops to this value
@@ -610,6 +617,7 @@ void StopChaosControl(bool normalEnd) {
     sActiveFrames = 0;
     sWindupFrames = 0;
     sJustStarted = false;
+    sThawed.clear();
 
     if (wasActive) {
         int seconds = CVarGetInteger(kCvarCooldown, 10);
@@ -780,6 +788,81 @@ bool IsFrozenByChaosControl(Actor* actor, Player* player) {
     return actor->id == ACTOR_EN_NUTSBALL;
 }
 
+// ----- Hitting frozen enemies -------------------------------------------------------------------
+// The game only lets an actor take part in hit tests while the actor itself is updating, and a frozen enemy does not
+// update. So while it is frozen we do the one thing its update would do for hits: we put its colliders on the list of
+// things that can be hit. When something hits it, the enemy gets one normal update (it takes the damage and starts
+// its reaction), then it is frozen again, so it holds that reaction until time moves on.
+
+constexpr int kMaxHitColliders = 24;
+// An enemy's colliders sit inside its own struct, and each one starts with a pointer back to the enemy. This finds
+// them by looking for that pointer, and checks the data after it to be sure it is a collider. With onlyHittable, only
+// colliders that can be hit are returned.
+int FindColliders(Actor* actor, Collider** out, int maxOut, bool onlyHittable) {
+    if (ActorDB::Instance == nullptr) {
+        return 0;
+    }
+    const size_t size = ActorDB::Instance->RetrieveEntry(actor->id).entry.instanceSize;
+    uint8_t* base = reinterpret_cast<uint8_t*>(actor);
+    int count = 0;
+    for (size_t off = sizeof(Actor); off + sizeof(Collider) <= size && count < maxOut; off += alignof(Collider)) {
+        Collider* c = reinterpret_cast<Collider*>(base + off);
+        if (c->actor != actor || c->shape > COLSHAPE_QUAD) {
+            continue;
+        }
+        if (c->shape == COLSHAPE_JNTSPH) {
+            const ColliderJntSph* sph = reinterpret_cast<const ColliderJntSph*>(c);
+            if (sph->count <= 0 || sph->count > 64 || sph->elements == nullptr) {
+                continue;
+            }
+        }
+        if (onlyHittable && (!(c->acFlags & AC_ON) || !(c->acFlags & AC_TYPE_ALL))) {
+            continue;
+        }
+        out[count++] = c;
+    }
+    return count;
+}
+
+// Called for a frozen enemy. True = it was hit and should run its update this frame. Otherwise its colliders are put
+// on the hit list for this frame.
+bool LetEnemyTakeHit(Actor* actor) {
+    Collider* colliders[kMaxHitColliders];
+    const int count = FindColliders(actor, colliders, kMaxHitColliders, true);
+    if (count == 0) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        if (colliders[i]->acFlags & AC_HIT) {
+            sThawed.push_back(actor);
+            return true;
+        }
+    }
+    for (int i = 0; i < count; i++) {
+        CollisionCheck_SetAC(gPlayState, &gPlayState->colChkCtx, colliders[i]);
+    }
+    return false;
+}
+
+// After the enemy took its hit: make sure the hit is not seen a second time.
+void OnActorUpdateChaosControl(void* refActor) {
+    if (sThawed.empty()) {
+        return;
+    }
+    Actor* actor = static_cast<Actor*>(refActor);
+    const auto it = std::find(sThawed.begin(), sThawed.end(), actor);
+    if (it == sThawed.end()) {
+        return;
+    }
+    sThawed.erase(it);
+    Collider* colliders[kMaxHitColliders];
+    const int count = FindColliders(actor, colliders, kMaxHitColliders, false);
+    for (int i = 0; i < count; i++) {
+        colliders[i]->acFlags &= ~AC_HIT;
+        colliders[i]->ac = nullptr;
+    }
+}
+
 void ShouldActorUpdateChaosControl(void* refActor, bool* result) {
     if (gPlayState == nullptr || refActor == nullptr) {
         return;
@@ -800,6 +883,9 @@ void ShouldActorUpdateChaosControl(void* refActor, bool* result) {
 
     // Time only stops after the beat drop (State::Active), not during the build-up.
     if (sState == State::Active && IsFrozenByChaosControl(actor, player)) {
+        if (actor->category == ACTORCAT_ENEMY && CVarGetInteger(kCvarHitEnemies, 1) != 0 && LetEnemyTakeHit(actor)) {
+            return; // it was hit: it updates this one frame
+        }
         *result = false;
     }
 }
@@ -844,6 +930,11 @@ void OnPlayDrawBeginChaosControl() {
             target[j].x = src[j * 3 + 0];
             target[j].y = src[j * 3 + 1];
             target[j].z = src[j * 3 + 2];
+        }
+        // Optional extra height for the whole pose (the pose file itself already keeps the soles above the floor).
+        const int lift = CVarGetInteger(kCvarPoseLift, 0);
+        if (lift != 0) {
+            target[0].y = static_cast<int16_t>(std::max(-32768, std::min(32767, static_cast<int>(target[0].y) + lift)));
         }
         weight = std::min(1.0f, static_cast<float>(sPoseTick + 1) / static_cast<float>(kBlendInFrames));
     } else {
@@ -963,6 +1054,7 @@ static void OnPlayDrawEndChaosControl() {
 static void RegisterChaosControl() {
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayerUpdate>(OnPlayerUpdateChaosControl);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::ShouldActorUpdate>(ShouldActorUpdateChaosControl);
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnActorUpdate>(OnActorUpdateChaosControl);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayDrawBegin>(OnPlayDrawBeginChaosControl);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayDrawEnd>(OnPlayDrawEndChaosControl);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnSceneInit>(
