@@ -27,11 +27,14 @@
 //   gShadow.Boost.Animation      1 = use the crouch and skating poses (default), 0 = only the speed
 //   gShadow.Boost.StartRate      playback speed of the crouch in percent, default 100
 //   gShadow.Boost.RunRate        playback speed of the skating run in percent, default 100
+//   gShadow.Boost.Debug          1 = show a small on-screen message when X is pressed (started / why it did not start)
+//                                and when a boost ends (why). Default 1 while the boost is being tested, 0 = silent.
 
 #include <libultraship/bridge/consolevariablebridge.h>
 
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
 #include "soh/ShipInit.hpp"
+#include "soh/Notification/Notification.h"
 
 #include <SDL2/SDL.h>
 #include <ship/Context.h>
@@ -88,6 +91,7 @@ constexpr const char* kCvarCrouchSpeed = "gShadow.Boost.CrouchSpeed";
 constexpr const char* kCvarAnimation = "gShadow.Boost.Animation";
 constexpr const char* kCvarStartRate = "gShadow.Boost.StartRate";
 constexpr const char* kCvarRunRate = "gShadow.Boost.RunRate";
+constexpr const char* kCvarDebug = "gShadow.Boost.Debug";
 
 constexpr const char* kFileStartAdult = "custom/boost/anim_start_adult.bin";
 constexpr const char* kFileStartChild = "custom/boost/anim_start_child.bin";
@@ -116,13 +120,37 @@ inline bool KeepGameLimb(int limb) {
 std::atomic<int> sWatchedButton{ SDL_CONTROLLER_BUTTON_X };
 std::atomic<bool> sPressPending{ false };
 std::atomic<uint32_t> sPressTick{ 0 };
+std::atomic<bool> sEventHeld{ false }; // the button is down, according to the button down / up events
 bool sWatchAdded = false;
 bool sPolledDown = false;
 
+// Sees every button press and release the moment it happens. The hold state comes from here as well as from looking
+// at the controller, because looking at the controller does not always work (then the boost would end the frame after
+// it started, as if X had been let go).
 int SDLCALL OnSdlEvent(void*, SDL_Event* event) {
-    if (event->type == SDL_CONTROLLERBUTTONDOWN && event->cbutton.button == sWatchedButton.load()) {
-        sPressTick = SDL_GetTicks();
-        sPressPending = true;
+    switch (event->type) {
+        case SDL_CONTROLLERBUTTONDOWN:
+            if (event->cbutton.button == sWatchedButton.load()) {
+                sPressTick = SDL_GetTicks();
+                sPressPending = true;
+                sEventHeld = true;
+            }
+            break;
+        case SDL_CONTROLLERBUTTONUP:
+            if (event->cbutton.button == sWatchedButton.load()) {
+                sEventHeld = false;
+            }
+            break;
+        case SDL_CONTROLLERDEVICEREMOVED:
+            sEventHeld = false;
+            break;
+        case SDL_WINDOWEVENT:
+            if (event->window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                sEventHeld = false;
+            }
+            break;
+        default:
+            break;
     }
     return 0;
 }
@@ -165,7 +193,7 @@ bool ReadButton() {
         pressed = true;
     }
     sPolledDown = down;
-    sHeld = down;
+    sHeld = down || sEventHeld.load();
 
     const int n64Button = CVarGetInteger(kCvarN64Button, 0);
     if (n64Button != 0 && gPlayState != nullptr) {
@@ -354,14 +382,26 @@ bool ChaosControlBusy() {
     return ShadowChaosControl_IsBusy != nullptr && ShadowChaosControl_IsBusy();
 }
 
-// True when Link is not in control or is in a state where boosting makes no sense.
-bool CannotBoost(Player* player) {
-    if (gPlayState->csCtx.state != CS_STATE_IDLE || Player_InCsMode(gPlayState)) {
-        return true;
+// A small on-screen message (bottom right, the game's own notification box) while the boost is being tested.
+void Say(const std::string& text) {
+    if (CVarGetInteger(kCvarDebug, 1) != 0) {
+        Notification::Emit({ .message = text, .remainingTime = 5.0f, .mute = true });
     }
-    if (gPlayState->pauseCtx.state != 0 || gPlayState->transitionTrigger != TRANS_TRIGGER_OFF ||
-        gPlayState->msgCtx.msgMode != MSGMODE_NONE) {
-        return true;
+}
+
+// nullptr when Link can boost, otherwise why not: Link is not in control or is in a state where boosting makes no sense.
+const char* CannotBoost(Player* player) {
+    if (gPlayState->csCtx.state != CS_STATE_IDLE || Player_InCsMode(gPlayState)) {
+        return "cutscene";
+    }
+    if (gPlayState->pauseCtx.state != 0) {
+        return "menu open";
+    }
+    if (gPlayState->transitionTrigger != TRANS_TRIGGER_OFF) {
+        return "scene change";
+    }
+    if (gPlayState->msgCtx.msgMode != MSGMODE_NONE) {
+        return "text box";
     }
     const u32 blocked1 = PLAYER_STATE1_INPUT_DISABLED | PLAYER_STATE1_TALKING | PLAYER_STATE1_DEAD |
                          PLAYER_STATE1_GETTING_ITEM | PLAYER_STATE1_IN_CUTSCENE | PLAYER_STATE1_IN_WATER |
@@ -374,10 +414,16 @@ bool CannotBoost(Player* player) {
     const u32 blocked2 = PLAYER_STATE2_UNDERWATER | PLAYER_STATE2_DIVING | PLAYER_STATE2_CRAWLING |
                          PLAYER_STATE2_GRABBED_BY_ENEMY | PLAYER_STATE2_FROZEN | PLAYER_STATE2_OCARINA_PLAYING |
                          PLAYER_STATE2_STATIONARY_LADDER;
-    if ((player->stateFlags1 & blocked1) || (player->stateFlags2 & blocked2)) {
-        return true;
+    if (player->stateFlags1 & blocked1) {
+        return "Link state (flags1)";
     }
-    return player->meleeWeaponState != 0;
+    if (player->stateFlags2 & blocked2) {
+        return "Link state (flags2)";
+    }
+    if (player->meleeWeaponState != 0) {
+        return "sword swing";
+    }
+    return nullptr;
 }
 
 // Standing, walking or running freely on the ground (not Z-targeting, rolling, swinging or anything else).
@@ -412,9 +458,12 @@ void BeginBoost(Player* player) {
 }
 
 // fade: blend the pose out over a few frames (false = it disappears at once).
-void EndBoost(bool fade) {
+void EndBoost(bool fade, const char* why = nullptr) {
     if (sState == State::Idle) {
         return;
+    }
+    if (why != nullptr) {
+        Say(std::string("Boost ended: ") + why);
     }
     sState = State::Idle;
     sInStart = false;
@@ -429,6 +478,7 @@ void ResetBoost() {
     sWeight = 0.0f;
     sPolledDown = false;
     sPressPending = false;
+    sEventHeld = false;
 }
 
 void RestoreHiddenButtons() {
@@ -462,7 +512,7 @@ void ShouldActorUpdateBoost(void* refActor, bool*) {
     Input* input = &gPlayState->state.input[0];
     const int n64Button = CVarGetInteger(kCvarN64Button, 0);
     const bool held = AnyControllerHolds(CVarGetInteger(kCvarSdlButton, SDL_CONTROLLER_BUTTON_X)) ||
-                      (sPressPending.load() && SDL_GetTicks() - sPressTick.load() <= kPressLifetimeMs) ||
+                      sEventHeld.load() || (sPressPending.load() && SDL_GetTicks() - sPressTick.load() <= kPressLifetimeMs) ||
                       (n64Button != 0 && CHECK_BTN_ANY(input->cur.button, n64Button));
     if (!held) {
         return;
@@ -505,29 +555,48 @@ void OnPlayerUpdateBoost() {
         if (sFadeOut > 0) {
             sFadeOut--;
         }
-        if (pressed && onGround && !ChaosControlBusy() && !CannotBoost(player) && FreeMovementAction(player)) {
-            BeginBoost(player);
+        if (pressed) {
+            const char* why = nullptr;
+            if (!onGround) {
+                why = "not on the ground";
+            } else if (ChaosControlBusy()) {
+                why = "Chaos Control pose is playing";
+            } else if ((why = CannotBoost(player)) != nullptr) {
+                // why says it
+            } else if (!FreeMovementAction(player)) {
+                why = "Link is busy (Z-targeting, rolling, swinging...)";
+            }
+            if (why == nullptr) {
+                BeginBoost(player);
+                Say("Boost!");
+            } else {
+                Say(std::string("Boost blocked: ") + why);
+            }
         }
         return;
     }
 
     // ----- boosting -----
     if (ChaosControlBusy()) {
-        EndBoost(false);
+        EndBoost(false, "Chaos Control pose started");
         return;
     }
-    if (CannotBoost(player) || !FreeMovementAction(player)) {
-        EndBoost(true);
+    if (const char* why = CannotBoost(player)) {
+        EndBoost(true, why);
+        return;
+    }
+    if (!FreeMovementAction(player)) {
+        EndBoost(true, "Link is busy (Z-targeting, rolling, swinging...)");
         return;
     }
     if (toggleMode ? pressed : !sHeld) {
-        EndBoost(true);
+        EndBoost(true, toggleMode ? "X pressed again" : "X let go");
         return;
     }
     if (onGround) {
         sAirFrames = 0;
     } else if (++sAirFrames >= kMaxAirFrames) {
-        EndBoost(true);
+        EndBoost(true, "left the ground");
         return;
     }
 
@@ -577,7 +646,7 @@ void OnPlayerUpdateBoost() {
         const float moved = std::sqrt(dx * dx + dz * dz);
         if (sBoostSpeed > 8.0f && moved < sBoostSpeed * 0.3f) {
             if (++sStuckCount >= kStuckFrames) {
-                EndBoost(true);
+                EndBoost(true, "ran into a wall");
                 return;
             }
         } else {
@@ -594,7 +663,7 @@ void OnPlayerUpdateBoost() {
     if (stickHeld) {
         sNeutralCount = 0;
     } else if (player->linearVelocity < 1.0f && ++sNeutralCount >= kNeutralFrames) {
-        EndBoost(true);
+        EndBoost(true, "stick let go");
         return;
     }
 
@@ -668,6 +737,7 @@ void RegisterBoost() {
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnLoadGame>([](int32_t) {
         ResetBoost();
         LoadAssets();
+        Say(HavePoses() ? "Shadow boost ready (X), poses loaded" : "Shadow boost ready (X), poses NOT found");
     });
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnExitGame>([](int32_t) { ResetBoost(); });
 }
