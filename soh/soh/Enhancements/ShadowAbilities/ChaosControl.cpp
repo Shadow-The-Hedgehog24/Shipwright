@@ -1040,7 +1040,7 @@ extern "C" bool ShadowChaosControl_IsBusy(void) {
 // 3 = 30 second time stop, greyscale world with red after images and aura, red copies of struck enemies.
 // 4 = works with the boomerang (and other items) in hand.
 extern "C" {
-int ShadowAbilityVersion_ChaosControl = 4;
+int ShadowAbilityVersion_ChaosControl = 5;
 }
 
 // ----- The red time stop look (version 3) ---------------------------------------------------------
@@ -1214,14 +1214,11 @@ static void FxReset() {
     sFxPulse = 0.0f;
     sFxDropAge = -2;
     sFxGrayOn = false;
-    if (sFxWrapped != nullptr && gPlayState != nullptr) {
-        // Only touch the actor if it is still the live player (after a scene change it is gone).
-        for (Actor* a = gPlayState->actorCtx.actorLists[ACTORCAT_PLAYER].head; a != nullptr; a = a->next) {
-            if (a == sFxWrapped && a->draw == FxPlayerDraw) {
-                a->draw = Player_Draw;
-            }
-        }
-    }
+    // Deliberately does NOT touch the player actor or walk the actor lists. This runs from the scene init hook, which the
+    // game calls before it has set up the actor lists of the new play state (garbage on the first scene, stale after a
+    // scene change), and from the load and exit hooks, where the play state may already be gone. The draw wrapper needs no
+    // undoing here: FxDrawBegin puts Player_Draw back on the next frame (the weight is 0 now, so nothing is wanted), and
+    // after a scene change the old player actor, and the wrapper in it, no longer exist.
     sFxWrapped = nullptr;
 }
 
