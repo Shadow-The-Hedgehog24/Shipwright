@@ -45,6 +45,9 @@ s32 func_8083A4A8(Player* player, PlayState* play);
 
 // The actions Link is in while standing, walking, running or Z-targeting on the ground.
 void Player_Action_Idle(Player* player, PlayState* play);
+void Player_Action_80842180(Player* player, PlayState* play); // running
+void Player_Action_8084227C(Player* player, PlayState* play); // running while Z-targeting
+void Player_Action_8084193C(Player* player, PlayState* play); // side-stepping while Z-targeting
 void Player_Action_80840450(Player* player, PlayState* play);
 void Player_Action_808407CC(Player* player, PlayState* play);
 void Player_Action_80840DE4(Player* player, PlayState* play);
@@ -174,12 +177,13 @@ bool CannotJump(Player* player) {
     return player->meleeWeaponState != 0;
 }
 
-// Standing, walking, running or Z-targeting on the ground, and not in the middle of a roll, a swing or anything else.
+// Standing, walking, running, side-stepping or Z-targeting on the ground (not in a roll, a swing or anything else).
 bool OnFootAction(Player* player) {
     const auto action = player->actionFunc;
     return action == Player_Action_Idle || action == Player_Action_80840450 || action == Player_Action_808407CC ||
            action == Player_Action_80840DE4 || action == Player_Action_808414F8 || action == Player_Action_8084170C ||
-           action == Player_Action_808417FC;
+           action == Player_Action_808417FC || action == Player_Action_80842180 || action == Player_Action_8084227C ||
+           action == Player_Action_8084193C;
 }
 
 float JumpSpeed(const char* strengthCvar) {
