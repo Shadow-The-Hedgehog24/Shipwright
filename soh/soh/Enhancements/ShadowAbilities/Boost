@@ -737,7 +737,6 @@ void RegisterBoost() {
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnLoadGame>([](int32_t) {
         ResetBoost();
         LoadAssets();
-        Say(HavePoses() ? "Shadow boost ready (X), poses loaded" : "Shadow boost ready (X), poses NOT found");
     });
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnExitGame>([](int32_t) { ResetBoost(); });
 }
@@ -745,3 +744,8 @@ void RegisterBoost() {
 static RegisterShipInitFunc sBoostInit(RegisterBoost);
 
 } // namespace
+
+// Read by the status report in Jump.cpp: tells it that this file is in the build, and which version it is.
+extern "C" {
+int ShadowAbilityVersion_Boost = 2;
+}
