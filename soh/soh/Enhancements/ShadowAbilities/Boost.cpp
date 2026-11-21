@@ -1,6 +1,6 @@
 // Shadow the Hedgehog - Boost (the X button) for Ship of Harkinian 9.3.1
 //
-// Version 3. Press X on the ground and the boost starts the way Chaos Control does: Shadow stops and plays the Chaos
+// Version 9 (v9: when the boost will not start, the on-screen message names the reason (first-person view, ready to fire, shield, ...); v8: the boost can be started and keeps going with the boomerang in hand; v7: at the drop the world turns greyscale (the HUD and Shadow keep their colour), Shadow leaves blue see-through after images and a soft blue aura that pulses when each one appears; v6: the charge-up pose is a mirror image of Chaos Control's, so the spin turns the other way and ends facing the other side; the pose now really drives the head and right hand; v5: speed 20, enemies and NPCs at half speed during the boost; v4: the game's own run lean and steering sway are taken off the head and chest while the run pose shows). Press X on the ground and the boost starts the way Chaos Control does: Shadow stops and plays the Chaos
 // Control pose while the boost tune plays (the tune starts with Shadow saying "Chaos Control", with the same timing as
 // the Chaos Control music). When the tune drops (about 2.5 seconds into it) Shadow bursts forward in his fast skating
 // run at a much higher speed than Link's normal run, and the tune plays on until the boost ends. Steer with the stick.
@@ -28,8 +28,9 @@
 //                                SoH's default controller layout puts the sword (B) on the X button; this stops the boost
 //                                from swinging the sword. Set 0 if X is not also your sword button and you want to swing while boosting.
 //   gShadow.Boost.Mode           0 = tap or hold (default), 1 = always toggle (press X again to stop), 2 = always hold
-//   gShadow.Boost.Speed          boost speed, default 13 (Link's normal run is about 6.6; a sword lunge is 15)
-//   gShadow.Boost.Accel          how fast the speed builds up per game frame, default 3
+//   gShadow.Boost.Speed          boost speed, default 20 (Link's normal run is about 6.6; a sword lunge is 15; v3 was 13)
+//   gShadow.Boost.Accel          how fast the speed builds up per game frame, default 4
+//   gShadow.Boost.SlowOthers     1 = enemies, bosses and other NPCs move at half speed while the boost is on (default), 0 = off
 //   gShadow.Boost.Windup         1 = the Chaos Control style charge-up with the tune (default), 0 = no charge-up, boost at once
 //   gShadow.Boost.Animation      1 = use the poses (default), 0 = only the speed
 //   gShadow.Boost.RunRate        playback speed of the skating run in percent, default 100
@@ -37,6 +38,18 @@
 //   gShadow.Boost.Volume         tune volume 0-100, default 80
 //   gShadow.Boost.DropOffset     move the moment the boost starts, in milliseconds (added to the drop time of the tune)
 //   gShadow.Boost.SyncOffset     move the tune against the pose, in milliseconds (negative = tune earlier)
+//   gShadow.Boost.Effect         1 = the boost look (greyscale world, blue after images, aura) on (default), 0 = off
+//   gShadow.Boost.Greyscale      1 = the world turns greyscale while boosting (default), 0 = no greyscale
+//   gShadow.Boost.Afterimages    1 = blue after images behind Shadow (default), 0 = none (needs shadow_ghost.o2r)
+//   gShadow.Boost.AfterimageInterval  game frames between two after images, default 2
+//   gShadow.Boost.AfterimageLife      game frames an after image lasts, default 10
+//   gShadow.Boost.AfterimageOpacity   opacity of a new after image in percent, default 55
+//   gShadow.Boost.Aura           1 = the soft blue aura around Shadow (default), 0 = none
+//   gShadow.Boost.AuraStrength   aura strength in percent, default 100
+//   gShadow.Boost.ItemsInHand    1 = the boost works with the boomerang in hand (default), 0 = it refuses while the boomerang
+//                                is the item in hand (the rule up to version 7). A slingshot, hookshot or bow that is out but
+//                                resting in the hand never blocked it. Only aiming blocks it (the item button held down:
+//                                first-person view, or "ready to fire"), and the shield held up.
 //   gShadow.Boost.Debug          1 = show a small on-screen message when X is pressed (started / why it did not start)
 //                                and when a boost ends (why). Default 1 while the boost is being tested, 0 = silent.
 
@@ -60,6 +73,7 @@
 #include <cstring>
 #include <memory>
 #include <sstream>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -69,6 +83,12 @@ extern "C" {
 #include "functions.h"
 #include "variables.h"
 extern PlayState* gPlayState;
+
+// OPEN_DISPS / CLOSE_DISPS declare these inside the function. They have to be found as C functions.
+void FrameInterpolation_RecordOpenChild(const void* a, int b);
+void FrameInterpolation_RecordCloseChild(void);
+// Finds a skeleton resource by its path (the same call the game makes when it starts a skeleton). nullptr if missing.
+SkeletonHeader* ResourceMgr_LoadSkeletonByName(const char* path, SkelAnime* skelAnime);
 
 // The game's own "where does the stick point" (target speed and direction, the direction is relative to the camera).
 s32 Player_GetMovementSpeedAndYaw(Player* player, f32* outSpeedTarget, s16* outYawTarget, f32 speedMode,
@@ -107,6 +127,16 @@ constexpr const char* kCvarVolume = "gShadow.Boost.Volume";
 constexpr const char* kCvarDropOffset = "gShadow.Boost.DropOffset";
 constexpr const char* kCvarSyncOffset = "gShadow.Boost.SyncOffset";
 constexpr const char* kCvarDebug = "gShadow.Boost.Debug";
+constexpr const char* kCvarSlowOthers = "gShadow.Boost.SlowOthers";
+constexpr const char* kCvarItems = "gShadow.Boost.ItemsInHand";
+constexpr const char* kCvarFx = "gShadow.Boost.Effect";
+constexpr const char* kCvarFxGrey = "gShadow.Boost.Greyscale";
+constexpr const char* kCvarFxAfter = "gShadow.Boost.Afterimages";
+constexpr const char* kCvarFxInterval = "gShadow.Boost.AfterimageInterval";
+constexpr const char* kCvarFxLife = "gShadow.Boost.AfterimageLife";
+constexpr const char* kCvarFxOpacity = "gShadow.Boost.AfterimageOpacity";
+constexpr const char* kCvarFxAura = "gShadow.Boost.Aura";
+constexpr const char* kCvarFxAuraStrength = "gShadow.Boost.AuraStrength";
 
 constexpr const char* kFileRunAdult = "custom/boost/anim_run_adult.bin";
 constexpr const char* kFileRunChild = "custom/boost/anim_run_child.bin";
@@ -116,6 +146,9 @@ constexpr const char* kFilePoseAdultCC = "custom/chaos_control/anim_adult.bin"; 
 constexpr const char* kFilePoseChildCC = "custom/chaos_control/anim_child.bin";
 constexpr const char* kFileMusic = "custom/boost/music.wav";
 constexpr const char* kFileSongConfig = "custom/boost/song_config.txt";
+// The see-through copy of Shadow's model for the after images (shadow_ghost.o2r).
+constexpr const char* kGhostSkelAdult = "objects/object_link_boy/gLinkAdultGhostSkel";
+constexpr const char* kGhostSkelChild = "objects/object_link_child/gLinkChildGhostSkel";
 
 constexpr uint32_t kPressLifetimeMs = 150; // a press seen by the event listener counts for this long
 constexpr float kChildSpeedScale = 0.9f;
@@ -134,9 +167,12 @@ constexpr int kMsPerFrame = 1000 / kFramesPerSecond;
 constexpr int kMaxWindupFrames = 60 * kFramesPerSecond; // safety: the burst starts after this long even without a drop
 constexpr float kStickThreshold = 22.0f;  // the game ignores a stick below about 20
 
-// Limbs the game drives itself (hat, collar, sheath, torso): the pose leaves them alone.
+// Joint-table entries the game keeps for itself: the pose leaves them alone. The table is numbered like PLAYER_LIMB_*
+// (entry 0 = root position, entry 1 = root limb, 2 = waist ... 11 = head, 12 = hat, 13 = collar, 19 = right hand,
+// 20 = sheath, 21 = torso), so this keeps the hat, collar, sheath and torso. (Up to v5 the numbers were one too low:
+// the head and right hand stayed under the game's control and the pose never turned the head.)
 inline bool KeepGameLimb(int limb) {
-    return limb == 11 || limb == 12 || limb == 19 || limb == 20;
+    return limb == 12 || limb == 13 || limb == 20 || limb == 21;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -620,6 +656,50 @@ float sFadeWeight = 0.0f;
 bool sHavePose = false;
 Vec3s sLastPose[kJoints];    // the pose that was shown last (before blending with the game's own pose)
 
+// ------------------------------------------------------------------------------------------------
+// The boost look (v7): greyscale world, blue after images, soft aura. State only; the code is further down.
+// ------------------------------------------------------------------------------------------------
+
+constexpr int kMaxGhosts = 16;
+constexpr int kFxFadeFrames = 5;       // the greyscale and the aura fade in and out over this many game frames
+constexpr int kDropFlashFrames = 9;    // the flash and the ring at the drop
+
+// One after image: Shadow's place and pose when it was made. It stays where it is (in the world) and fades out.
+struct Ghost {
+    bool used;
+    bool child;
+    uint32_t id;
+    int age;                // game frames since it was made
+    Vec3f pos;
+    Vec3s rot;              // actor.shape.rot
+    Vec3f scale;            // actor.scale
+    float yOffset;          // actor.shape.yOffset * scale.y
+    float rootDrop;         // Player::unk_6C4, taken off the root height when drawing
+    Vec3s upperRot;
+    Vec3s headRot;
+    s16 upperYawSecondary;
+    Vec3s joints[kJoints];  // the joint table that was drawn
+};
+
+Ghost sGhosts[kMaxGhosts];
+uint32_t sGhostNextId = 1;
+int sSinceSpawn = 0;          // game frames since the last after image
+Vec3f sLastGhostPos = { 0.0f, 0.0f, 0.0f };
+bool sHaveLastGhostPos = false;
+float sFxWeight = 0.0f;       // 0..1: how much of the look is on (greyscale amount, aura strength)
+float sPulse = 0.0f;          // aura pulse, set to 1 when a new after image is made
+int sDropAge = -2;            // game frames since the drop (flash and ring), -2 = none
+uint32_t sFxTick = 0;         // counts game frames
+uint32_t sFxSpawnTick = 0xFFFFFFFFu;
+bool sGrayOn = false;         // greyscale was switched on in this frame's display lists
+bool sGrayWasOn = false;      // ... and in the frame before
+ActorFunc sOrigPlayerDraw = nullptr;
+int sGhostSkelState[2] = { -1, -1 }; // adult, child: -1 not checked, 0 missing, 1 found
+
+void FxOnDrop();
+void FxReset();
+void FxPreload();
+
 // Hiding the sword button while X is held (see gShadow.Boost.BlockButtons).
 bool sInputHidden = false;
 u16 sHiddenCur = 0;
@@ -658,15 +738,43 @@ const char* CannotBoost(Player* player) {
                          PLAYER_STATE1_GETTING_ITEM | PLAYER_STATE1_IN_CUTSCENE | PLAYER_STATE1_IN_WATER |
                          PLAYER_STATE1_ON_HORSE | PLAYER_STATE1_CLIMBING_LEDGE | PLAYER_STATE1_HANGING_OFF_LEDGE |
                          PLAYER_STATE1_CLIMBING_LADDER | PLAYER_STATE1_DAMAGED | PLAYER_STATE1_FIRST_PERSON |
-                         PLAYER_STATE1_CARRYING_ACTOR | PLAYER_STATE1_USING_BOOMERANG |
-                         PLAYER_STATE1_HOOKSHOT_FALLING | PLAYER_STATE1_LOADING | PLAYER_STATE1_FLOOR_DISABLED |
-                         PLAYER_STATE1_READY_TO_FIRE | PLAYER_STATE1_SHIELDING |
+                         PLAYER_STATE1_CARRYING_ACTOR | PLAYER_STATE1_HOOKSHOT_FALLING | PLAYER_STATE1_LOADING |
+                         PLAYER_STATE1_FLOOR_DISABLED | PLAYER_STATE1_READY_TO_FIRE | PLAYER_STATE1_SHIELDING |
                          PLAYER_STATE1_START_CHANGING_HELD_ITEM;
     const u32 blocked2 = PLAYER_STATE2_UNDERWATER | PLAYER_STATE2_DIVING | PLAYER_STATE2_CRAWLING |
                          PLAYER_STATE2_GRABBED_BY_ENEMY | PLAYER_STATE2_FROZEN | PLAYER_STATE2_OCARINA_PLAYING |
                          PLAYER_STATE2_STATIONARY_LADDER;
     if (player->stateFlags1 & blocked1) {
-        return "Link state (flags1)";
+        // Say which state it is (version 9), so a report of "it will not start" shows the cause on screen.
+        const u32 f = player->stateFlags1;
+        if (f & PLAYER_STATE1_FIRST_PERSON) {
+            return "first-person view (aiming)";
+        }
+        if (f & PLAYER_STATE1_READY_TO_FIRE) {
+            return "aiming (bow / slingshot / hookshot ready to fire)";
+        }
+        if (f & PLAYER_STATE1_SHIELDING) {
+            return "shield held up";
+        }
+        if (f & PLAYER_STATE1_CARRYING_ACTOR) {
+            return "carrying something";
+        }
+        if (f & PLAYER_STATE1_START_CHANGING_HELD_ITEM) {
+            return "changing the held item";
+        }
+        if (f & PLAYER_STATE1_DAMAGED) {
+            return "hurt";
+        }
+        static char sWhy[64];
+        std::snprintf(sWhy, sizeof(sWhy), "Link state (flags1 %08X)", static_cast<unsigned>(f & blocked1));
+        return sWhy;
+    }
+    // Items in hand do not stop the boost (version 8). PLAYER_STATE1_USING_BOOMERANG is set the whole time the
+    // boomerang is the item in hand (taken out, in flight, being caught), not only while it is being thrown. Aiming
+    // with it (the item button held down) puts Link into the first-person view, which stays blocked above.
+    // gShadow.Boost.ItemsInHand = 0 brings the old rule back.
+    if ((player->stateFlags1 & PLAYER_STATE1_USING_BOOMERANG) && CVarGetInteger(kCvarItems, 1) == 0) {
+        return "boomerang in hand";
     }
     if (player->stateFlags2 & blocked2) {
         return "Link state (flags2)";
@@ -692,7 +800,7 @@ bool JumpingInAir(Player* player) {
 }
 
 float TargetSpeed() {
-    const float speed = std::max(0.0f, CVarGetFloat(kCvarSpeed, 13.0f));
+    const float speed = std::max(0.0f, CVarGetFloat(kCvarSpeed, 20.0f));
     return IsChild() ? speed * kChildSpeedScale : speed;
 }
 
@@ -722,6 +830,7 @@ void EnterActive(Player* player, bool afterWindup) {
     const int mode = CVarGetInteger(kCvarMode, 0);
     sLatched = (mode == 1) || (mode == 0 && afterWindup && !sHeld);
     Say(sLatched ? "Boost! (press X to stop)" : "Boost! (hold X)");
+    FxOnDrop();
 }
 
 void BeginBoost(Player* player) {
@@ -733,6 +842,7 @@ void BeginBoost(Player* player) {
     sWeight = 0.0f;
     sInputFlagSet = false;
     sStartHealth = gSaveContext.health;
+    FxPreload(); // the see-through model is read during the charge-up, not at the drop
 
     const bool windup = CVarGetInteger(kCvarWindup, 1) != 0;
     const bool haveMusic = windup && SoundOn() && sMusic.ok && EnsureDevice();
@@ -792,6 +902,7 @@ void ResetBoost() {
     sPolledDown = false;
     sPressPending = false;
     sEventHeld = false;
+    FxReset();
 }
 
 void RestoreHiddenButtons() {
@@ -809,12 +920,36 @@ void RestoreHiddenButtons() {
 
 // Runs right before an actor updates. For Link: during the charge-up the game's own input lock (Link cannot walk, roll,
 // attack or use items), otherwise hide the sword button while X is held, so a boost is not a sword swing.
-void ShouldActorUpdateBoost(void* refActor, bool*) {
+// While the boost is on, enemies, bosses and other NPCs only get an update every second game frame, so they move,
+// animate and act at half speed. (Their hit boxes are only active in the frames they update, the same as in Chaos Control.)
+bool SlowedByBoost(const Actor* actor, const Player* player) {
+    if (actor == &player->actor || actor == player->heldActor || actor == player->naviActor ||
+        actor->parent == &player->actor) {
+        return false;
+    }
+    switch (actor->category) {
+        case ACTORCAT_ENEMY:
+        case ACTORCAT_BOSS:
+        case ACTORCAT_NPC:
+            return true;
+        default:
+            return actor->id == ACTOR_EN_NUTSBALL; // deku scrub nuts
+    }
+}
+
+void ShouldActorUpdateBoost(void* refActor, bool* result) {
     if (gPlayState == nullptr || refActor == nullptr || !CVarGetInteger(kCvarEnabled, 1)) {
         return;
     }
     Player* player = GET_PLAYER(gPlayState);
-    if (player == nullptr || static_cast<Actor*>(refActor) != &player->actor) {
+    if (player == nullptr) {
+        return;
+    }
+    if (static_cast<Actor*>(refActor) != &player->actor) {
+        if (sState == State::Active && (gPlayState->gameplayFrames & 1) != 0 && CVarGetInteger(kCvarSlowOthers, 1) != 0 &&
+            SlowedByBoost(static_cast<Actor*>(refActor), player)) {
+            *result = false;
+        }
         return;
     }
     if (sState == State::Windup) {
@@ -886,7 +1021,7 @@ void TickWindup(Player* player) {
     }
 }
 
-void OnPlayerUpdateBoost() {
+void UpdateBoost() {
     if (gPlayState == nullptr) {
         return;
     }
@@ -923,7 +1058,10 @@ void OnPlayerUpdateBoost() {
             } else if ((why = CannotBoost(player)) != nullptr) {
                 // why says it
             } else if (!FreeMovementAction(player)) {
-                why = "Link is busy (Z-targeting, rolling, swinging...)";
+                static char sBusy[96];
+                std::snprintf(sBusy, sizeof(sBusy), "Link is busy (Z-targeting, rolling, swinging... flags1 %08X)",
+                              static_cast<unsigned>(player->stateFlags1));
+                why = sBusy;
             }
             if (why == nullptr) {
                 BeginBoost(player);
@@ -1034,7 +1172,7 @@ void OnPlayerUpdateBoost() {
         sStuckCount = 0;
         sNeutralCount = 0;
     } else if (stickHeld && !reversing) {
-        sBoostSpeed = Approach(sBoostSpeed, TargetSpeed(), std::max(0.1f, CVarGetFloat(kCvarAccel, 3.0f)));
+        sBoostSpeed = Approach(sBoostSpeed, TargetSpeed(), std::max(0.1f, CVarGetFloat(kCvarAccel, 4.0f)));
         player->linearVelocity = sBoostSpeed;
 
         // Pushing against a wall: give up after a moment.
@@ -1072,8 +1210,9 @@ void OnPlayerUpdateBoost() {
     sWeight = Approach(sWeight, wantPose ? 1.0f : 0.0f, wantPose ? 0.5f : 0.34f);
 }
 
-// Runs right before the game draws the frame, after the game has put Link's normal pose into his joint table.
-void OnPlayDrawBeginBoost() {
+// Puts the boost poses into Link's joint table. Runs right before the game draws the frame, after the game has put
+// Link's normal pose into his joint table.
+void ApplyBoostPose() {
     if (gPlayState == nullptr) {
         return;
     }
@@ -1137,6 +1276,19 @@ void OnPlayDrawBeginBoost() {
         return;
     }
 
+    // While Link runs faster than 5 the game adds its own forward lean to the chest and a counter-tilt plus a steering
+    // sway (up to about 20 degrees, it follows the smallest stick movement) to the head, on top of whatever pose the
+    // joint table holds (Player_UpdateLookAngles / func_8083DDC8, applied in the limb override). The head of the boost run
+    // is placed with those left out, so they would tilt it down and make it shake. They are taken out while the pose shows.
+    // (Only the pitch and roll parts; the yaw parts are the game's look-at turn.)
+    {
+        const float keep = 1.0f - std::min(1.0f, weight);
+        player->upperLimbRot.x = static_cast<int16_t>(std::lround(player->upperLimbRot.x * keep));
+        player->upperLimbRot.z = static_cast<int16_t>(std::lround(player->upperLimbRot.z * keep));
+        player->headLimbRot.x = static_cast<int16_t>(std::lround(player->headLimbRot.x * keep));
+        player->headLimbRot.z = static_cast<int16_t>(std::lround(player->headLimbRot.z * keep));
+    }
+
     const int joints = std::min<int>(kJoints, player->skelAnime.limbCount);
     Vec3s* table = player->skelAnime.jointTable;
     for (int j = 0; j < joints; j++) {
@@ -1155,15 +1307,528 @@ void OnPlayDrawBeginBoost() {
     }
 }
 
+// OPEN_DISPS / CLOSE_DISPS declare the frame interpolation functions inside the function; in a nameless namespace those
+// would be new functions that do not exist. These two do the same with the C functions (declared at the top) by name.
+#define BOOST_OPEN_DISPS(gfxCtx)                    \
+    {                                               \
+        GraphicsContext* __gfxCtx = (gfxCtx);       \
+        (void)__gfxCtx;                             \
+        ::FrameInterpolation_RecordOpenChild(__FILE__, __LINE__)
+#define BOOST_CLOSE_DISPS()                         \
+    ::FrameInterpolation_RecordCloseChild();        \
+    }
+
+// ------------------------------------------------------------------------------------------------
+// The boost look (v7): from the drop on the world is greyscale (the HUD and Shadow keep their colour), Shadow leaves
+// blue see-through after images behind him, and a soft blue aura glows around him and pulses when a new after image
+// appears. A flash and a ring go out at the drop.
+//
+//  * Greyscale: the renderer has a "grayscale" switch (the same one the medallion pause screen uses). It is switched on
+//    at the start of the world's display lists and off again for the HUD. Shadow's own draw is wrapped (the player's
+//    draw function is replaced while the look is on) so the switch is off while he is drawn.
+//  * After images: a copy of Shadow's pose is stored every few frames (where he is, how he stands). They are drawn
+//    after the whole world, with the see-through copy of his model from shadow_ghost.o2r, a flat blue with his shading,
+//    and fade out where they are. They are drawn in the world's own space, so they stay put while Shadow runs on.
+//  * Aura: a soft round gradient facing the camera, a little behind Shadow, so it only shows around him.
+// ------------------------------------------------------------------------------------------------
+
+bool FxEnabled() {
+    return CVarGetInteger(kCvarEnabled, 1) != 0 && CVarGetInteger(kCvarFx, 1) != 0;
+}
+
+int ClampInt(int v, int lo, int hi) {
+    return std::max(lo, std::min(hi, v));
+}
+
+bool ArchiveHasFile(const char* path) {
+    Ship::Context* ctx = Ship::Context::GetRawInstance();
+    if (ctx == nullptr) {
+        return false;
+    }
+    auto resourceManager = ctx->GetResourceManager();
+    if (resourceManager == nullptr) {
+        return false;
+    }
+    auto archiveManager = resourceManager->GetArchiveManager();
+    return archiveManager != nullptr && archiveManager->HasFile(path);
+}
+
+// The see-through copy of Shadow's skeleton, or nullptr when shadow_ghost.o2r is not installed.
+const FlexSkeletonHeader* GhostSkeleton(bool child) {
+    int& state = sGhostSkelState[child ? 1 : 0];
+    const char* path = child ? kGhostSkelChild : kGhostSkelAdult;
+    if (state < 0) {
+        state = ArchiveHasFile(path) ? 1 : 0;
+    }
+    if (state == 0) {
+        return nullptr;
+    }
+    const FlexSkeletonHeader* skeleton =
+        reinterpret_cast<const FlexSkeletonHeader*>(ResourceMgr_LoadSkeletonByName(path, nullptr));
+    if (skeleton == nullptr || skeleton->sh.segment == nullptr || skeleton->sh.limbCount < 21) {
+        state = 0;
+        return nullptr;
+    }
+    return skeleton;
+}
+
+u8 GrayAmount() {
+    return static_cast<u8>(std::lround(std::max(0.0f, std::min(1.0f, sFxWeight)) * 255.0f));
+}
+
+// Shadow himself is drawn in colour: the greyscale switch is off while the player's draw function runs.
+void ShadowPlayerDraw(Actor* thisx, PlayState* play) {
+    GraphicsContext* gfxCtx = play->state.gfxCtx;
+    BOOST_OPEN_DISPS(gfxCtx);
+    if (sGrayOn) {
+        gSPGrayscale(POLY_OPA_DISP++, false);
+        gSPGrayscale(POLY_XLU_DISP++, false);
+    }
+    if (sOrigPlayerDraw != nullptr) {
+        sOrigPlayerDraw(thisx, play);
+    }
+    if (sGrayOn) {
+        const u8 amount = GrayAmount();
+        gSPGrayscale(POLY_OPA_DISP++, true);
+        gDPSetGrayscaleColor(POLY_OPA_DISP++, 255, 255, 255, amount);
+        gSPGrayscale(POLY_XLU_DISP++, true);
+        gDPSetGrayscaleColor(POLY_XLU_DISP++, 255, 255, 255, amount);
+    }
+    BOOST_CLOSE_DISPS();
+}
+
+// Puts our draw function in the player's place while the look is on, and the game's own back afterwards.
+void SetDrawWrapper(Player* player, bool wrap) {
+    Actor* actor = &player->actor;
+    if (wrap) {
+        if (actor->draw != nullptr && actor->draw != ShadowPlayerDraw) {
+            sOrigPlayerDraw = actor->draw;
+            actor->draw = ShadowPlayerDraw;
+        }
+    } else if (actor->draw == ShadowPlayerDraw) {
+        actor->draw = sOrigPlayerDraw;
+    }
+}
+
+void FxReset() {
+    std::memset(sGhosts, 0, sizeof(sGhosts));
+    sSinceSpawn = 0;
+    sHaveLastGhostPos = false;
+    sFxWeight = 0.0f;
+    sPulse = 0.0f;
+    sDropAge = -2;
+    sGrayOn = false; // sGrayWasOn stays, so the next frame switches the greyscale off in the display lists
+    if (gPlayState != nullptr) {
+        if (Player* player = GET_PLAYER(gPlayState)) {
+            SetDrawWrapper(player, false);
+        }
+    }
+}
+
+// Loads the see-through skeleton ahead of time, so the first after image does not make the game hitch.
+void FxPreload() {
+    if (FxEnabled() && CVarGetInteger(kCvarFxAfter, 1) != 0) {
+        (void)GhostSkeleton(IsChild());
+    }
+}
+
+void FxOnDrop() {
+    sDropAge = -1; // the game frame update that follows makes it 0, the first frame that is drawn
+    sSinceSpawn = 1000;
+    sHaveLastGhostPos = false;
+    sPulse = 1.0f;
+}
+
+// Once per game frame, after the player's update.
+void FxTick() {
+    const bool on = FxEnabled() && sState == State::Active;
+    sFxWeight = Approach(sFxWeight, on ? 1.0f : 0.0f, 1.0f / static_cast<float>(kFxFadeFrames));
+    sPulse *= 0.6f;
+    if (sPulse < 0.03f) {
+        sPulse = 0.0f;
+    }
+    if (sDropAge > -2 && ++sDropAge > kDropFlashFrames) {
+        sDropAge = -2;
+    }
+    if (sSinceSpawn < 1000) {
+        sSinceSpawn++;
+    }
+    if (!FxEnabled()) {
+        std::memset(sGhosts, 0, sizeof(sGhosts));
+    }
+    const int life = ClampInt(CVarGetInteger(kCvarFxLife, 10), 3, 40);
+    for (Ghost& g : sGhosts) {
+        if (g.used && ++g.age >= life) {
+            g.used = false;
+        }
+    }
+    sFxTick++;
+}
+
+void OnPlayerUpdateBoost() {
+    UpdateBoost();
+    FxTick();
+}
+
+// Turns the greyscale on for the world's display lists (and off for the HUD's), and puts our draw function in place.
+void FxDrawBegin() {
+    sGrayOn = false;
+    if (gPlayState == nullptr) {
+        return;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    const bool want = player != nullptr && FxEnabled() && CVarGetInteger(kCvarFxGrey, 1) != 0 && sFxWeight > 0.01f &&
+                      gPlayState->pauseCtx.state == 0;
+    if (want || sGrayWasOn) {
+        GraphicsContext* gfxCtx = gPlayState->state.gfxCtx;
+        BOOST_OPEN_DISPS(gfxCtx);
+        if (want) {
+            const u8 amount = GrayAmount();
+            gSPGrayscale(POLY_OPA_DISP++, true);
+            gDPSetGrayscaleColor(POLY_OPA_DISP++, 255, 255, 255, amount);
+            gSPGrayscale(POLY_XLU_DISP++, true);
+            gDPSetGrayscaleColor(POLY_XLU_DISP++, 255, 255, 255, amount);
+        } else {
+            gSPGrayscale(POLY_OPA_DISP++, false);
+            gSPGrayscale(POLY_XLU_DISP++, false);
+        }
+        gSPGrayscale(OVERLAY_DISP++, false); // the HUD stays in colour
+        BOOST_CLOSE_DISPS();
+    }
+    sGrayOn = want;
+    sGrayWasOn = want;
+    if (player != nullptr) {
+        SetDrawWrapper(player, want);
+    }
+}
+
+// Runs right before the game draws the frame, after the game has put Link's normal pose into his joint table.
+void OnPlayDrawBeginBoost() {
+    ApplyBoostPose();
+    FxDrawBegin();
+}
+
+// Stores a new after image when it is time. Runs at the end of the world's draw, so the joint table is the one that was
+// just drawn (every pose change of every file is in it).
+void TrySpawnGhost(Player* player) {
+    if (sFxSpawnTick == sFxTick) {
+        return;
+    }
+    sFxSpawnTick = sFxTick;
+    if (!FxEnabled() || CVarGetInteger(kCvarFxAfter, 1) == 0 || sState != State::Active) {
+        return;
+    }
+    const int interval = ClampInt(CVarGetInteger(kCvarFxInterval, 2), 1, 20);
+    if (sSinceSpawn < interval || player->skelAnime.jointTable == nullptr || player->skelAnime.limbCount < kJoints ||
+        GhostSkeleton(IsChild()) == nullptr) {
+        return;
+    }
+    const Vec3f& pos = player->actor.world.pos;
+    if (sHaveLastGhostPos) {
+        const float dx = pos.x - sLastGhostPos.x;
+        const float dy = pos.y - sLastGhostPos.y;
+        const float dz = pos.z - sLastGhostPos.z;
+        if (dx * dx + dy * dy + dz * dz < 12.0f * 12.0f) {
+            return; // standing still: no new after image
+        }
+    }
+    Ghost* slot = nullptr;
+    for (Ghost& g : sGhosts) {
+        if (!g.used) {
+            slot = &g;
+            break;
+        }
+        if (slot == nullptr || g.age > slot->age) {
+            slot = &g;
+        }
+    }
+    std::memset(slot, 0, sizeof(*slot));
+    slot->used = true;
+    slot->child = IsChild();
+    slot->id = sGhostNextId++;
+    slot->pos = pos;
+    slot->rot = player->actor.shape.rot;
+    slot->scale = player->actor.scale;
+    slot->yOffset = player->actor.shape.yOffset * player->actor.scale.y;
+    slot->rootDrop = player->unk_6C4;
+    slot->upperRot = player->upperLimbRot;
+    slot->headRot = player->headLimbRot;
+    slot->upperYawSecondary = player->upperLimbYawSecondary;
+    std::memcpy(slot->joints, player->skelAnime.jointTable, sizeof(slot->joints));
+    sSinceSpawn = 0;
+    sPulse = 1.0f; // the aura pulses when an after image appears
+    sLastGhostPos = pos;
+    sHaveLastGhostPos = true;
+}
+
+// The same changes the game makes to Link's root, upper body and head while it draws him (Player_OverrideLimbDrawGameplayCommon).
+s32 GhostOverrideLimbDraw(PlayState* play, s32 limbIndex, Gfx** dList, Vec3f* pos, Vec3s* rot, void* arg) {
+    (void)play;
+    (void)dList;
+    const Ghost* g = static_cast<const Ghost*>(arg);
+    constexpr float kToRadians = 3.14159265f / 32768.0f;
+    if (limbIndex == PLAYER_LIMB_ROOT) {
+        if (g->child) {
+            pos->x *= 0.64f;
+            pos->y *= 0.64f;
+            pos->z *= 0.64f;
+        }
+        pos->y -= g->rootDrop;
+    } else if (limbIndex == PLAYER_LIMB_HEAD) {
+        rot->x += g->headRot.z;
+        rot->y -= g->headRot.y;
+        rot->z += g->headRot.x;
+    } else if (limbIndex == PLAYER_LIMB_UPPER) {
+        if (g->upperYawSecondary != 0) {
+            Matrix_RotateZ(0x44C * kToRadians, MTXMODE_APPLY);
+            Matrix_RotateY(g->upperYawSecondary * kToRadians, MTXMODE_APPLY);
+        }
+        if (g->upperRot.y != 0) {
+            Matrix_RotateY(g->upperRot.y * kToRadians, MTXMODE_APPLY);
+        }
+        if (g->upperRot.x != 0) {
+            Matrix_RotateX(g->upperRot.x * kToRadians, MTXMODE_APPLY);
+        }
+        if (g->upperRot.z != 0) {
+            Matrix_RotateZ(g->upperRot.z * kToRadians, MTXMODE_APPLY);
+        }
+    }
+    return false;
+}
+
+void DrawGhost(PlayState* play, const Ghost& g, const FlexSkeletonHeader* skeleton, u8 alpha) {
+    GraphicsContext* gfxCtx = play->state.gfxCtx;
+    // Each after image is its own piece for the frame interpolation, so it is only ever blended with itself.
+    ::FrameInterpolation_RecordOpenChild(reinterpret_cast<const void*>(static_cast<uintptr_t>(0x5AD00000u + g.id)), 0);
+    BOOST_OPEN_DISPS(gfxCtx);
+
+    Matrix_Push();
+    Vec3s rot = g.rot;
+    Matrix_SetTranslateRotateYXZ(g.pos.x, g.pos.y + g.yOffset + 1.0f, g.pos.z, &rot);
+    Matrix_Scale(g.scale.x, g.scale.y, g.scale.z, MTXMODE_APPLY);
+
+    // Flat blue with the model's own shading, see-through, depth-tested but not written. (The model's meshes carry no
+    // material, so everything that decides how it looks is set here.)
+    gDPPipeSync(POLY_OPA_DISP++);
+    gSPTexture(POLY_OPA_DISP++, 0xFFFF, 0xFFFF, 0, G_TX_RENDERTILE, G_OFF);
+    gDPSetCombineLERP(POLY_OPA_DISP++, SHADE, 0, ENVIRONMENT, PRIMITIVE, 0, 0, 0, ENVIRONMENT, SHADE, 0, ENVIRONMENT,
+                      PRIMITIVE, 0, 0, 0, ENVIRONMENT);
+    gDPSetOtherMode(POLY_OPA_DISP++,
+                    G_AD_NOTPATTERN | G_CD_MAGICSQ | G_CK_NONE | G_TC_FILT | G_TF_BILERP | G_TT_NONE | G_TL_TILE |
+                        G_TD_CLAMP | G_TP_PERSP | G_CYC_1CYCLE | G_PM_NPRIMITIVE,
+                    G_AC_NONE | G_ZS_PIXEL | G_RM_AA_ZB_XLU_SURF | G_RM_AA_ZB_XLU_SURF2);
+    gSPLoadGeometryMode(POLY_OPA_DISP++, G_ZBUFFER | G_SHADE | G_SHADING_SMOOTH);
+    gDPSetPrimColor(POLY_OPA_DISP++, 0, 0, 30, 60, 90, 255);
+    gDPSetEnvColor(POLY_OPA_DISP++, 90, 160, 255, alpha);
+
+    SkelAnime_DrawFlexOpa(play, static_cast<void**>(skeleton->sh.segment), const_cast<Vec3s*>(g.joints),
+                          skeleton->dListCount, GhostOverrideLimbDraw, nullptr, const_cast<Ghost*>(&g));
+    Matrix_Pop();
+
+    BOOST_CLOSE_DISPS();
+    ::FrameInterpolation_RecordCloseChild();
+}
+
+void DrawGhosts(PlayState* play, const Player* player) {
+    if (!FxEnabled() || CVarGetInteger(kCvarFxAfter, 1) == 0) {
+        return;
+    }
+    const float life = static_cast<float>(ClampInt(CVarGetInteger(kCvarFxLife, 10), 3, 40));
+    const float opacity = static_cast<float>(ClampInt(CVarGetInteger(kCvarFxOpacity, 55), 0, 100)) / 100.0f;
+    // Oldest first, so the newest is drawn on top.
+    const Ghost* order[kMaxGhosts];
+    int count = 0;
+    for (const Ghost& g : sGhosts) {
+        if (g.used && g.age >= 1) {
+            order[count++] = &g;
+        }
+    }
+    std::sort(order, order + count, [](const Ghost* a, const Ghost* b) { return a->age > b->age; });
+    for (int i = 0; i < count; i++) {
+        const Ghost& g = *order[i];
+        const float dx = g.pos.x - player->actor.world.pos.x;
+        const float dy = g.pos.y - player->actor.world.pos.y;
+        const float dz = g.pos.z - player->actor.world.pos.z;
+        if (dx * dx + dy * dy + dz * dz < 10.0f * 10.0f) {
+            continue; // right inside Shadow: would only flicker against him
+        }
+        const float t = std::min(1.0f, static_cast<float>(g.age) / life);
+        const float alpha = opacity * std::pow(1.0f - t, 1.4f);
+        const int a8 = static_cast<int>(std::lround(alpha * 255.0f));
+        const FlexSkeletonHeader* skeleton = GhostSkeleton(g.child);
+        if (a8 < 4 || skeleton == nullptr) {
+            continue;
+        }
+        DrawGhost(play, g, skeleton, static_cast<u8>(std::min(255, a8)));
+    }
+}
+
+// One ring of the round gradient: its radius (in 1/8 world units) and colour.
+struct BandRow {
+    float radius;
+    u8 r, g, b, a;
+};
+
+// A round band made of triangles with the colours of its rows blended between them (a soft edge). Facing +Z, centred on
+// the origin. Needs the matrix and the see-through vertex-colour state to be set.
+void DrawBand(GraphicsContext* gfxCtx, const BandRow* rows, int rowCount, int segments) {
+    BOOST_OPEN_DISPS(gfxCtx);
+    constexpr int kSegmentsPerChunk = 6; // keeps every vertex load small
+    for (int first = 0; first < segments; first += kSegmentsPerChunk) {
+        const int count = std::min(kSegmentsPerChunk, segments - first);
+        const int perRow = count + 1;
+        const int vertexCount = rowCount * perRow;
+        Vtx* vtx = static_cast<Vtx*>(Graph_Alloc(gfxCtx, static_cast<size_t>(vertexCount) * sizeof(Vtx)));
+        if (vtx == nullptr) {
+            continue;
+        }
+        for (int row = 0; row < rowCount; row++) {
+            for (int i = 0; i < perRow; i++) {
+                const float angle = 6.2831853f * static_cast<float>(first + i) / static_cast<float>(segments);
+                Vtx_t& v = vtx[row * perRow + i].v;
+                v.ob[0] = static_cast<s16>(std::lround(rows[row].radius * std::cos(angle)));
+                v.ob[1] = static_cast<s16>(std::lround(rows[row].radius * std::sin(angle)));
+                v.ob[2] = 0;
+                v.flag = 0;
+                v.tc[0] = 0;
+                v.tc[1] = 0;
+                v.cn[0] = rows[row].r;
+                v.cn[1] = rows[row].g;
+                v.cn[2] = rows[row].b;
+                v.cn[3] = rows[row].a;
+            }
+        }
+        gSPVertex(POLY_XLU_DISP++, reinterpret_cast<uintptr_t>(vtx), vertexCount, 0);
+        for (int row = 0; row + 1 < rowCount; row++) {
+            for (int i = 0; i < count; i++) {
+                const int a = row * perRow + i;
+                const int b = a + 1;
+                const int c = a + perRow;
+                const int d = c + 1;
+                gSP2Triangles(POLY_XLU_DISP++, a, c, b, 0, b, c, d, 0);
+            }
+        }
+    }
+    BOOST_CLOSE_DISPS();
+}
+
+u8 ToByte(float v) {
+    return static_cast<u8>(std::lround(std::max(0.0f, std::min(1.0f, v)) * 255.0f));
+}
+
+// The soft aura behind Shadow, and the flash and ring at the drop.
+void DrawAura(PlayState* play, const Player* player) {
+    if (!FxEnabled() || CVarGetInteger(kCvarFxAura, 1) == 0) {
+        return;
+    }
+    const float strength = static_cast<float>(ClampInt(CVarGetInteger(kCvarFxAuraStrength, 100), 0, 300)) / 100.0f;
+    const float weight = std::min(1.0f, sFxWeight);
+    const bool flash = sDropAge >= 0 && sDropAge <= kDropFlashFrames;
+    if ((weight <= 0.02f && !flash) || strength <= 0.0f) {
+        return;
+    }
+    const bool child = IsChild();
+    const float flashT = flash ? 1.0f - static_cast<float>(sDropAge) / static_cast<float>(kDropFlashFrames) : 0.0f;
+    const float radius = (child ? 44.0f : 58.0f) * (1.0f + 0.07f * sPulse + 0.9f * flashT);
+    const float alpha = std::min(0.9f, ((0.38f + 0.40f * sPulse) * weight + 0.55f * flashT) * strength);
+
+    // The middle of the aura: his chest, pushed a little away from the camera, so his body is in front of it.
+    Vec3f centre = player->actor.world.pos;
+    centre.y += child ? 26.0f : 38.0f;
+    const Vec3f& eye = play->view.eye;
+    const float vx = centre.x - eye.x;
+    const float vy = centre.y - eye.y;
+    const float vz = centre.z - eye.z;
+    const float length = std::sqrt(vx * vx + vy * vy + vz * vz);
+    if (length > 1.0f) {
+        const float back = child ? 12.0f : 18.0f;
+        centre.x += vx / length * back;
+        centre.y += vy / length * back;
+        centre.z += vz / length * back;
+    }
+
+    static const int sAuraTag = 0;
+    GraphicsContext* gfxCtx = play->state.gfxCtx;
+    ::FrameInterpolation_RecordOpenChild(&sAuraTag, 0);
+    BOOST_OPEN_DISPS(gfxCtx);
+
+    Gfx_SetupDL_4Xlu(gfxCtx);
+    gDPSetCombineMode(POLY_XLU_DISP++, G_CC_SHADE, G_CC_SHADE);
+    gSPClearGeometryMode(POLY_XLU_DISP++, G_LIGHTING | G_CULL_BOTH);
+
+    Matrix_Translate(centre.x, centre.y, centre.z, MTXMODE_NEW);
+    Matrix_ReplaceRotation(&play->billboardMtxF);
+    Matrix_Scale(1.0f / 8.0f, 1.0f / 8.0f, 1.0f / 8.0f, MTXMODE_APPLY); // the vertices are in 1/8 world units
+    gSPMatrix(POLY_XLU_DISP++, MATRIX_NEWMTX(gfxCtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+
+    // Bright blue in the middle, fading to nothing at the edge.
+    const float r8 = radius * 8.0f;
+    const BandRow aura[3] = {
+        { 0.0f, 170, 225, 255, ToByte(alpha) },
+        { r8 * 0.42f, 80, 160, 255, ToByte(alpha * 0.6f) },
+        { r8, 40, 100, 255, 0 },
+    };
+    DrawBand(gfxCtx, aura, 3, 12);
+
+    // The ring that goes out at the drop.
+    if (flash) {
+        const float progress = static_cast<float>(sDropAge) / static_cast<float>(kDropFlashFrames);
+        const float ringRadius = (child ? 44.0f : 58.0f) * (0.5f + 2.2f * progress) * 8.0f;
+        const float half = ringRadius * 0.2f + 24.0f;
+        const float ringAlpha = 0.8f * (1.0f - progress) * std::min(1.5f, strength);
+        const BandRow ring[3] = {
+            { ringRadius - half, 190, 230, 255, 0 },
+            { ringRadius, 190, 230, 255, ToByte(ringAlpha) },
+            { ringRadius + half, 190, 230, 255, 0 },
+        };
+        DrawBand(gfxCtx, ring, 3, 24);
+    }
+
+    BOOST_CLOSE_DISPS();
+    ::FrameInterpolation_RecordCloseChild();
+}
+
+// Runs at the end of the world's draw, before the HUD: the after images, then the aura.
+void OnPlayDrawEndBoost() {
+    if (gPlayState == nullptr) {
+        return;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    if (player == nullptr || gPlayState->pauseCtx.state != 0) {
+        return;
+    }
+    TrySpawnGhost(player);
+    bool anyGhost = false;
+    for (const Ghost& g : sGhosts) {
+        anyGhost = anyGhost || g.used;
+    }
+    const bool flash = sDropAge >= 0 && sDropAge <= kDropFlashFrames;
+    if (!FxEnabled() || (!anyGhost && sFxWeight <= 0.02f && !flash)) {
+        return;
+    }
+    GraphicsContext* gfxCtx = gPlayState->state.gfxCtx;
+    {
+        // What we draw now is in colour, not in the world's greyscale.
+        BOOST_OPEN_DISPS(gfxCtx);
+        gSPGrayscale(POLY_OPA_DISP++, false);
+        gSPGrayscale(POLY_XLU_DISP++, false);
+        BOOST_CLOSE_DISPS();
+    }
+    DrawGhosts(gPlayState, player);
+    DrawAura(gPlayState, player);
+}
+
 void RegisterBoost() {
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayerUpdate>(OnPlayerUpdateBoost);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::ShouldActorUpdate>(ShouldActorUpdateBoost);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayDrawBegin>(OnPlayDrawBeginBoost);
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayDrawEnd>(OnPlayDrawEndBoost);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnSceneInit>([](int16_t) { ResetBoost(); });
     // The pause menu does not run player updates, so end the boost when it opens.
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnKaleidoscopeUpdate>([](int16_t) { ResetBoost(); });
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnLoadGame>([](int32_t) {
         ResetBoost();
+        sGhostSkelState[0] = sGhostSkelState[1] = -1; // look for shadow_ghost.o2r again
         LoadAssets();
     });
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnExitGame>([](int32_t) { ResetBoost(); });
@@ -1186,6 +1851,9 @@ extern "C" bool ShadowBoost_IsBusy(void) {
 
 // Read by the status report in Jump.cpp: tells it that this file is in the build, and which version it is.
 // 3 = Chaos Control style charge-up with the tune, burst at the drop, boost survives jumps.
+// 7 = greyscale world, blue after images (shadow_ghost.o2r) and aura while boosting.
+// 8 = works with the boomerang (and other items) in hand.
+// 9 = the "Boost blocked" message names the reason.
 extern "C" {
-int ShadowAbilityVersion_Boost = 3;
+int ShadowAbilityVersion_Boost = 9;
 }
