@@ -29,6 +29,8 @@
 //   gShadow.Jump.Strength        ground jump strength in percent, default 100 (Roc's Feather's jump: 7.5 adult, 7.0 child)
 //   gShadow.Jump.DoubleStrength  air jump strength in percent, default 100
 //   gShadow.Jump.Boost           1 = a little forward push on the air jump (default), 0 = straight up
+//   gShadow.Jump.Boomerang       1 = Y jumps and double jumps work while the boomerang is in hand: aiming it, with it
+//                                thrown and flying, and catching it (default), 0 = no jumping then (the way it was up to v5)
 //   gShadow.Jump.Animation       1 = use the jump and flip poses (default), 0 = the game's own jump animation
 //   gShadow.Jump.FirstRate       playback speed of the first jump pose in percent, default 0 = automatic (the pose
 //                                is sped up so that it lasts as long as the jump)
@@ -112,6 +114,7 @@ constexpr const char* kCvarCount = "gShadow.Jump.Count";
 constexpr const char* kCvarStrength = "gShadow.Jump.Strength";
 constexpr const char* kCvarDoubleStrength = "gShadow.Jump.DoubleStrength";
 constexpr const char* kCvarBoost = "gShadow.Jump.Boost";
+constexpr const char* kCvarBoomerang = "gShadow.Jump.Boomerang";
 constexpr const char* kCvarAnimation = "gShadow.Jump.Animation";
 constexpr const char* kCvarFirstRate = "gShadow.Jump.FirstRate";
 constexpr const char* kCvarSecondRate = "gShadow.Jump.SecondRate";
@@ -224,7 +227,7 @@ bool CannotJump(Player* player) {
                          PLAYER_STATE1_GETTING_ITEM | PLAYER_STATE1_IN_CUTSCENE | PLAYER_STATE1_IN_WATER |
                          PLAYER_STATE1_ON_HORSE | PLAYER_STATE1_CLIMBING_LEDGE | PLAYER_STATE1_HANGING_OFF_LEDGE |
                          PLAYER_STATE1_CLIMBING_LADDER | PLAYER_STATE1_DAMAGED | PLAYER_STATE1_FIRST_PERSON |
-                         PLAYER_STATE1_CARRYING_ACTOR | PLAYER_STATE1_USING_BOOMERANG |
+                         PLAYER_STATE1_CARRYING_ACTOR |
                          PLAYER_STATE1_HOOKSHOT_FALLING | PLAYER_STATE1_LOADING | PLAYER_STATE1_FLOOR_DISABLED |
                          PLAYER_STATE1_READY_TO_FIRE | PLAYER_STATE1_SHIELDING |
                          PLAYER_STATE1_START_CHANGING_HELD_ITEM;
@@ -232,6 +235,12 @@ bool CannotJump(Player* player) {
                          PLAYER_STATE2_GRABBED_BY_ENEMY | PLAYER_STATE2_FROZEN | PLAYER_STATE2_OCARINA_PLAYING |
                          PLAYER_STATE2_STATIONARY_LADDER;
     if ((player->stateFlags1 & blocked1) || (player->stateFlags2 & blocked2)) {
+        return true;
+    }
+    // PLAYER_STATE1_USING_BOOMERANG is set the whole time the boomerang is the item in hand (aiming, thrown, caught
+    // again), so it used to block every jump while Shadow had the boomerang out. Jumping is fine then: the boomerang
+    // is an upper body action that carries on by itself in the air. (gShadow.Jump.Boomerang 0 brings the old rule back.)
+    if ((player->stateFlags1 & PLAYER_STATE1_USING_BOOMERANG) && CVarGetInteger(kCvarBoomerang, 1) == 0) {
         return true;
     }
     // Not in the middle of a sword swing (a jump slash must finish).
@@ -857,7 +866,7 @@ void OnPlayDrawBeginCarry() {
 // gShadow.Status 0 turns the report off.
 // ------------------------------------------------------------------------------------------------
 
-constexpr int kJumpVersion = 5;
+constexpr int kJumpVersion = 6;
 constexpr const char* kCvarStatus = "gShadow.Status";
 constexpr int kStatusDelayFrames = 40; // game frames of play after the load (2 seconds)
 
