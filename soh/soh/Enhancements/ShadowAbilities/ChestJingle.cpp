@@ -8,6 +8,8 @@
 // lifts the item (the item shows up on frame 21 of the lift animation, 1.05 s later). The tune starts later in that
 // animation, exactly early enough that its drop (drop_ms from config.txt) arrives when the item appears. The game
 // normally starts the "You got an item" fanfare right after the lift; that one is muted too while the tune plays.
+// Only those fanfares are muted, and the fanfare channel's volume is put back to normal as soon as they are over, so
+// every other jingle (ocarina songs, item fanfares outside a chest, ...) plays as usual.
 //
 // The sound comes from the audio mod chaos_control_audio.o2r (or any .o2r in the mods folder):
 //   custom/chest_jingle/jingle.wav   the tune
@@ -50,6 +52,7 @@ extern "C" {
 #include "macros.h"
 #include "functions.h"
 #include "seqcmd.h"
+#include "sequence.h"
 extern PlayState* gPlayState;
 }
 
@@ -85,6 +88,10 @@ std::atomic<bool> sPlaying{ false };
 // set on the audio thread when the chest fanfare starts, read and cleared on the game thread
 std::atomic<bool> sArmed{ false };
 std::atomic<bool> sSawFanfare{ false }; // the chest fanfare started (whether or not the tune is loaded)
+// We set the fanfare channel's volume to 0 and have not put it back yet. The game remembers that volume and starts the
+// next fanfare with it (Audio_StartSequence re-applies gActiveSeqs[].volCur), so it has to be put back, or every later
+// jingle (the ocarina songs, for one) would be silent.
+std::atomic<bool> sFanfareMuted{ false };
 int sArmedFrames = 0; // game thread only
 
 // A small on-screen message (bottom right) while the jingle is being tested. Game thread only.
@@ -238,28 +245,60 @@ void StopJingle() {
     SDL_UnlockAudioDevice(sDevice);
 }
 
+// The fanfares the game plays when Link holds up what came out of a chest.
+bool IsItemFanfare(int32_t seqId) {
+    const int32_t id = seqId & 0xFF;
+    return id == NA_BGM_ITEM_GET || id == NA_BGM_SMALL_ITEM_GET || id == NA_BGM_HEART_GET;
+}
+
+void MuteFanfare() {
+    SEQCMD_SET_SEQPLAYER_VOLUME(SEQ_PLAYER_FANFARE, 0, 0);
+    sFanfareMuted.store(true);
+}
+
+// Normal volume again (0x7F = 1.0).
+void RestoreFanfareVolume() {
+    if (sFanfareMuted.exchange(false)) {
+        SEQCMD_SET_SEQPLAYER_VOLUME(SEQ_PLAYER_FANFARE, 0, 0x7F);
+    }
+}
+
 // Called by the game whenever a sequence player starts a sequence. This runs on the audio thread, so it only does
 // small things: remember that the chest fanfare started, and queue the command that mutes the fanfare player.
-// The muted fanfare keeps running silently, so the game's own timing (music ducking and restoring) is not disturbed,
-// and the game resets the volume the next time it starts a fanfare.
+// The muted fanfare keeps running silently, so the game's own timing (music ducking and restoring) is not disturbed.
+// The volume is put back when the fanfare channel goes quiet again (OnPlayerUpdateChestJingle), or right here when a
+// fanfare that is not ours starts while the channel is still muted.
 void OnSeqPlayerInitChestJingle(int32_t playerIdx, int32_t seqId) {
-    if (playerIdx == SEQ_PLAYER_FANFARE && (seqId & 0xFF) == NA_BGM_OPEN_TRE_BOX) {
-        sSawFanfare.store(true);
-    }
-    if (!sReady || playerIdx != SEQ_PLAYER_FANFARE || !CVarGetInteger(kCvarEnabled, 1)) {
+    if (playerIdx != SEQ_PLAYER_FANFARE) {
         return;
     }
-    if ((seqId & 0xFF) == NA_BGM_OPEN_TRE_BOX) {
-        sArmed.store(true);
-        SEQCMD_SET_SEQPLAYER_VOLUME(SEQ_PLAYER_FANFARE, 0, 0);
-    } else if ((sPlaying.load() || sArmed.load()) && !CVarGetInteger(kCvarKeepItemFanfare, 0)) {
-        // the "You got an item" fanfare that starts right after Link lifts the item
-        SEQCMD_SET_SEQPLAYER_VOLUME(SEQ_PLAYER_FANFARE, 0, 0);
+    const bool chestFanfare = (seqId & 0xFF) == NA_BGM_OPEN_TRE_BOX;
+    if (chestFanfare) {
+        sSawFanfare.store(true);
     }
+    if (sReady && CVarGetInteger(kCvarEnabled, 1)) {
+        if (chestFanfare) {
+            sArmed.store(true);
+            MuteFanfare();
+            return;
+        }
+        if (IsItemFanfare(seqId) && (sPlaying.load() || sArmed.load()) && !CVarGetInteger(kCvarKeepItemFanfare, 0)) {
+            // the "You got an item" fanfare that starts right after Link lifts the item
+            MuteFanfare();
+            return;
+        }
+    }
+    // Some other fanfare (an ocarina song, an item outside a chest, ...): it must be heard.
+    RestoreFanfareVolume();
 }
 
 // Game thread, once per game frame.
 void OnPlayerUpdateChestJingle() {
+    // The muted fanfares are over: give the fanfare channel its volume back for the next jingle.
+    if (sFanfareMuted.load() && func_800FA0B4(SEQ_PLAYER_FANFARE) == NA_BGM_DISABLED) {
+        RestoreFanfareVolume();
+        Say("Fanfare volume restored");
+    }
     if (sSawFanfare.exchange(false)) {
         Say(sReady ? "Chest fanfare seen, jingle armed" : "Chest fanfare seen, but the jingle tune is NOT loaded");
     }
@@ -313,10 +352,12 @@ void RegisterChestJingle() {
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnSceneInit>([](int16_t) {
         LoadJingle();
         sArmed.store(false);
+        RestoreFanfareVolume();
     });
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnExitGame>([](int32_t) {
         sArmed.store(false);
         StopJingle();
+        RestoreFanfareVolume();
     });
 }
 
@@ -326,5 +367,5 @@ static RegisterShipInitFunc sChestJingleInit(RegisterChestJingle);
 
 // Read by the status report in Jump.cpp: tells it that this file is in the build, and which version it is.
 extern "C" {
-int ShadowAbilityVersion_ChestJingle = 2;
+int ShadowAbilityVersion_ChestJingle = 3;
 }
