@@ -6,6 +6,11 @@
 //     touching the ground gives it back. Y works during Chaos Control once time has stopped.
 //   Walking off a ledge or jumping with the A button still uses the game's own jump and fall animations.
 //
+// Homing attack (version 7): in the air, with Navi over an enemy, Y does not jump but starts the homing attack of
+// HomingAttack.cpp (the Chaos teleport strike). This file owns Shadow's poses, so it plays the two homing poses for it:
+// the dive (the vanish) and the flip kick (the strike), custom/homing/* in chaos_control_audio.o2r. CVar
+// gShadow.Homing.StrikeRate (percent, default 260) is the playback speed of the kick.
+//
 // Carrying (this file also fixes two things that show up when Shadow carries something, Princess Ruto for instance):
 //   * Ruto sat inside Shadow's head. The game puts a carried actor halfway between Link's two hands, and Shadow's hands
 //     are at head height. Ruto is now moved up and forward (a few game units, see the settings below).
@@ -96,6 +101,9 @@ void Player_Action_808417FC(Player* player, PlayState* play);
 
 // Provided by ChaosControl.cpp. True while Chaos Control holds Link still. Weak, so this file also works without it.
 extern "C" __attribute__((weak)) bool ShadowChaosControl_IsBusy(void);
+// InhibitorRings.cpp: true while Shadow takes his rings off (held still, Y must not break out of the pose), and its version.
+extern "C" __attribute__((weak)) bool ShadowRings_IsBusy(void);
+extern "C" __attribute__((weak)) int ShadowAbilityVersion_Rings;
 
 // Version numbers that Boost.cpp, ChestJingle.cpp and ChaosControl.cpp define (see the end of each file). Weak, so a file that
 // is missing from the build, or an old version of it, simply reads as 0. Used by the status report on load.
@@ -103,6 +111,9 @@ extern "C" __attribute__((weak)) int ShadowAbilityVersion_Boost;
 extern "C" __attribute__((weak)) bool ShadowBoost_IsBusy(void); // Boost.cpp: true while its charge-up pose plays
 extern "C" __attribute__((weak)) int ShadowAbilityVersion_ChestJingle;
 extern "C" __attribute__((weak)) int ShadowAbilityVersion_ChaosControl;
+// HomingAttack.cpp: called when Y is pressed in the air. True = the press was used (an attack started or is running).
+extern "C" __attribute__((weak)) bool ShadowHoming_TryStart(Player* player);
+extern "C" __attribute__((weak)) int ShadowAbilityVersion_Homing;
 
 namespace {
 
@@ -131,6 +142,11 @@ constexpr const char* kFileFirstAdult = "custom/jump/anim_jump1_adult.bin";
 constexpr const char* kFileFirstChild = "custom/jump/anim_jump1_child.bin";
 constexpr const char* kFileSecondAdult = "custom/jump/anim_jump2_adult.bin";
 constexpr const char* kFileSecondChild = "custom/jump/anim_jump2_child.bin";
+constexpr const char* kFileLaunchAdult = "custom/homing/anim_launch_adult.bin";
+constexpr const char* kFileLaunchChild = "custom/homing/anim_launch_child.bin";
+constexpr const char* kFileStrikeAdult = "custom/homing/anim_strike_adult.bin";
+constexpr const char* kFileStrikeChild = "custom/homing/anim_strike_child.bin";
+constexpr const char* kCvarStrikeRate = "gShadow.Homing.StrikeRate";
 
 // An air jump needs the first jump to be at least this many game frames old (the game runs at 20 frames a second).
 constexpr int kMinAirFrames = 4;
@@ -211,7 +227,8 @@ int sJumpsLeft = 0; // air jumps still available in this stay in the air
 // True while Chaos Control's start pose or the boost's charge-up pose holds Link still (Y must not break out of them).
 bool ChaosControlBusy() {
     return (ShadowChaosControl_IsBusy != nullptr && ShadowChaosControl_IsBusy()) ||
-           (ShadowBoost_IsBusy != nullptr && ShadowBoost_IsBusy());
+           (ShadowBoost_IsBusy != nullptr && ShadowBoost_IsBusy()) ||
+           (ShadowRings_IsBusy != nullptr && ShadowRings_IsBusy());
 }
 
 // True when Link is not in control or is in a state where a jump makes no sense.
@@ -275,6 +292,7 @@ struct AnimData {
 };
 
 AnimData sFirstAdult, sFirstChild, sSecondAdult, sSecondChild;
+AnimData sLaunchAdult, sLaunchChild, sStrikeAdult, sStrikeChild; // the homing attack's poses
 bool sAssetsTried = false;
 
 std::shared_ptr<Ship::File> LoadModFile(const std::string& path) {
@@ -325,17 +343,27 @@ void LoadAssets() {
     LoadAnim(kFileFirstChild, sFirstChild);
     LoadAnim(kFileSecondAdult, sSecondAdult);
     LoadAnim(kFileSecondChild, sSecondChild);
+    LoadAnim(kFileLaunchAdult, sLaunchAdult);
+    LoadAnim(kFileLaunchChild, sLaunchChild);
+    LoadAnim(kFileStrikeAdult, sStrikeAdult);
+    LoadAnim(kFileStrikeChild, sStrikeChild);
 }
 
 bool IsChild() {
     return gSaveContext.linkAge == LINK_AGE_CHILD;
 }
 
-enum class Pose { None, First, Second };
+enum class Pose { None, First, Second, Launch, Strike };
 
 const AnimData& AnimFor(Pose pose) {
     if (pose == Pose::Second) {
         return IsChild() ? sSecondChild : sSecondAdult;
+    }
+    if (pose == Pose::Launch) {
+        return IsChild() ? sLaunchChild : sLaunchAdult;
+    }
+    if (pose == Pose::Strike) {
+        return IsChild() ? sStrikeChild : sStrikeAdult;
     }
     return IsChild() ? sFirstChild : sFirstAdult;
 }
@@ -411,6 +439,7 @@ bool sHaveLast = false;
 Vec3s sLastPose[kJoints]; // the pose that was drawn last
 Vec3s sFromPose[kJoints]; // the pose we blend away from when a new pose starts while one is showing
 int sBlendLeft = 0;
+bool sPoseOneShot = false; // the pose ends (blends out) when it has played through, instead of holding its last frame
 
 // How many game frames until Link lands, if nothing gets in the way (his gravity, from where he is now).
 int EstimateAirFrames(Player* player) {
@@ -432,7 +461,7 @@ int EstimateAirFrames(Player* player) {
 }
 
 // Start (or switch to) a pose. Called right after the jump was started, so the speed up is known.
-void StartPose(Pose pose, Player* player) {
+void StartPose(Pose pose, Player* player, float fixedRate = 0.0f, bool instant = false) {
     if (!CVarGetInteger(kCvarAnimation, 1)) {
         return;
     }
@@ -443,8 +472,8 @@ void StartPose(Pose pose, Player* player) {
     if (anim.frames <= 0) {
         return;
     }
-    // From a pose that is showing: blend from it instead of jumping to the new pose.
-    if (sHaveLast && (sPose != Pose::None || sFadeOut > 0)) {
+    // From a pose that is showing: blend from it instead of jumping to the new pose. (The homing poses show at once.)
+    if (!instant && sHaveLast && (sPose != Pose::None || sFadeOut > 0)) {
         std::memcpy(sFromPose, sLastPose, sizeof(sFromPose));
         sBlendLeft = kBlendInFrames;
         if (sPose == Pose::None) {
@@ -452,12 +481,21 @@ void StartPose(Pose pose, Player* player) {
         }
     } else {
         sBlendLeft = 0;
-        sWeight = 0.0f;
+        sWeight = instant ? 1.0f : 0.0f;
+    }
+    if (instant) {
+        sBlendLeft = 0;
+        sWeight = 1.0f;
     }
     sFadeOut = 0;
     sPose = pose;
     sPoseT = 0.0f;
     sPoseAge = 0;
+    sPoseOneShot = fixedRate > 0.0f && pose == Pose::Strike;
+    if (fixedRate > 0.0f) {
+        sPoseRate = fixedRate;
+        return;
+    }
 
     // The playback speed: set so that the pose is over a little before Link lands (it holds its last frame after that).
     const int userRate = CVarGetInteger(pose == Pose::Second ? kCvarSecondRate : kCvarFirstRate, 0);
@@ -545,6 +583,9 @@ void OnPlayerUpdateJump() {
         sPoseAge++;
         sPoseT += sPoseRate;
         sWeight = Approach(sWeight, 1.0f, 0.5f);
+        if (sPoseOneShot && sPoseT >= static_cast<float>(AnimFor(sPose).frames - 1)) {
+            EndPose(true); // the kick has played through: back to the game's own falling pose
+        }
         if (sBlendLeft > 0) {
             sBlendLeft--;
         }
@@ -565,6 +606,11 @@ void OnPlayerUpdateJump() {
         if (CVarGetInteger(kCvarGround, 1) != 0 && OnFootAction(player)) {
             GroundJump(player);
         }
+        return;
+    }
+
+    // Navi over an enemy: the homing attack instead of a jump (it also swallows the presses while the attack plays).
+    if (ShadowHoming_TryStart != nullptr && ShadowHoming_TryStart(player)) {
         return;
     }
 
@@ -866,7 +912,8 @@ void OnPlayDrawBeginCarry() {
 // gShadow.Status 0 turns the report off.
 // ------------------------------------------------------------------------------------------------
 
-constexpr int kJumpVersion = 6;
+// 8 = knows the inhibitor rings (Y cannot break out of the rings pose; the status report lists them).
+constexpr int kJumpVersion = 8;
 constexpr const char* kCvarStatus = "gShadow.Status";
 constexpr int kStatusDelayFrames = 40; // game frames of play after the load (2 seconds)
 
@@ -894,6 +941,8 @@ void ReportStatus() {
     const int boost = VersionOf(&ShadowAbilityVersion_Boost);
     const int chest = VersionOf(&ShadowAbilityVersion_ChestJingle);
     const int chaos = VersionOf(&ShadowAbilityVersion_ChaosControl);
+    const int homing = VersionOf(&ShadowAbilityVersion_Homing);
+    const int rings = VersionOf(&ShadowAbilityVersion_Rings);
 
     SayStatus(std::string("Shadow Jump v") + std::to_string(kJumpVersion) + ": OK, " +
               (sFirstAdult.frames > 0 && sSecondAdult.frames > 0 ? "poses found" : "poses NOT found"));
@@ -914,6 +963,37 @@ void ReportStatus() {
         SayStatus(std::string("Shadow Chaos Control v") + std::to_string(chaos) + ": OK");
     } else {
         SayStatus("Shadow Chaos Control: old version (ChaosControl.cpp)");
+    }
+    if (homing > 0) {
+        SayStatus(std::string("Shadow Homing attack v") + std::to_string(homing) + ": OK, " +
+                  (sLaunchAdult.frames > 0 && sStrikeAdult.frames > 0 ? "poses found" : "poses NOT found"));
+    } else {
+        SayStatus("Shadow Homing attack: NOT in this build (HomingAttack.cpp missing)");
+    }
+    if (rings > 0) {
+        SayStatus(std::string("Shadow Inhibitor Rings v") + std::to_string(rings) + ": OK, " +
+                  (ModFileExists("custom/inhibitor_rings/anim_adult.bin") ? "pose found, " : "pose NOT found, ") +
+                  (ModFileExists("custom/inhibitor_rings/music.wav") ? "music found" : "music NOT found"));
+    } else {
+        SayStatus("Shadow Inhibitor Rings: NOT in this build (InhibitorRings.cpp missing)");
+    }
+}
+
+// For HomingAttack.cpp: 1 = the dive pose (the vanish), 2 = the flip kick (the strike). Both show at once (no blend), the
+// dive is held, the kick plays through at CVar gShadow.Homing.StrikeRate percent speed and then blends out.
+void StartHomingPose(int which) {
+    if (gPlayState == nullptr) {
+        return;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    if (player == nullptr) {
+        return;
+    }
+    if (which == 1) {
+        StartPose(Pose::Launch, player, 1.0f, true);
+    } else {
+        const float rate = static_cast<float>(std::max(50, std::min(600, CVarGetInteger(kCvarStrikeRate, 260)))) / 100.0f;
+        StartPose(Pose::Strike, player, rate, true);
     }
 }
 
@@ -965,6 +1045,11 @@ void RegisterJump() {
 static RegisterShipInitFunc sJumpInit(RegisterJump);
 
 } // namespace
+
+// Used by HomingAttack.cpp: starts one of its two poses on Shadow.
+extern "C" void ShadowJump_StartHomingPose(int which) {
+    StartHomingPose(which);
+}
 
 extern "C" {
 int ShadowAbilityVersion_Jump = 3;
