@@ -95,6 +95,7 @@
 #include <ship/resource/archive/ArchiveManager.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -119,6 +120,8 @@ void FrameInterpolation_RecordCloseChild(void);
 SkeletonHeader* ResourceMgr_LoadSkeletonByName(const char* path, SkelAnime* skelAnime);
 // The player's own draw function (the one the game puts in his actor when he is created).
 void Player_Draw(Actor* thisx, PlayState* play2);
+// Boost.cpp's draw wrapper: true when fn is it. Not there when Boost.cpp is not in the build.
+__attribute__((weak)) bool ShadowBoost_IsPlayerDrawWrapper(ActorFunc fn);
 }
 
 // The red look (further down in this file). These are used by the code in the nameless namespace below.
@@ -156,6 +159,7 @@ constexpr const char* kCvarFxLife = "gShadow.ChaosControl.AfterimageLife";
 constexpr const char* kCvarFxOpacity = "gShadow.ChaosControl.AfterimageOpacity";
 constexpr const char* kCvarFxAura = "gShadow.ChaosControl.Aura";
 constexpr const char* kCvarFxAuraStrength = "gShadow.ChaosControl.AuraStrength";
+constexpr const char* kCvarFxAuraPulse = "gShadow.ChaosControl.AuraPulse";
 constexpr const char* kCvarFxHit = "gShadow.ChaosControl.HitAfterimages";
 constexpr const char* kCvarFxHitLife = "gShadow.ChaosControl.HitAfterimageLife";
 constexpr const char* kCvarFxHitOpacity = "gShadow.ChaosControl.HitAfterimageOpacity";
@@ -489,6 +493,7 @@ State sState = State::Idle;
 std::vector<Actor*> sThawed; // frozen enemies that were let through for one frame to take a hit
 int sActiveFrames = 0;      // frames of freeze left
 int sActiveTotal = 1;       // frames of freeze in total (for the bar)
+std::chrono::steady_clock::time_point sActiveStart; // when the freeze began (real time, the music runs on real time)
 int sEndCueFrames = 0;      // the ending sound starts when sActiveFrames drops to this value
 bool sEndCuePlayed = false;
 int sCooldownFrames = 0;
@@ -541,7 +546,7 @@ int AnimControlMs() {
 }
 
 int FreezeFrames() {
-    const int seconds = std::max(1, CVarGetInteger(kCvarDuration, 30));
+    const int seconds = std::max(1, CVarGetInteger(kCvarDuration, 27));
     return seconds * kFramesPerSecond;
 }
 
@@ -556,6 +561,7 @@ void EnterActive() {
     sEndCueFrames = extra;
     sActiveFrames = FreezeFrames() + extra;
     sActiveTotal = sActiveFrames;
+    sActiveStart = std::chrono::steady_clock::now();
     sEndCuePlayed = false;
     sBlendOut = kBlendOutFrames; // the pose fades out into Link's normal pose
     ::FxOnDrop();                // the greyscale, the flash and the ring start with the freeze
@@ -787,6 +793,11 @@ void OnPlayerUpdateChaosControl() {
             if (PlayerBusy(player)) {
                 StopChaosControl(false);
             } else {
+                // The music plays in real time. If the game runs slower than its 20 frames per second the frame count
+                // would run late, so the freeze never lasts longer in real time than it should.
+                const int clockMs = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sActiveStart).count());
+                sActiveFrames = std::min(sActiveFrames, sActiveTotal - clockMs / kMsPerFrame);
                 if (!sEndCuePlayed && sActiveFrames <= sEndCueFrames) {
                     PlayEndCue();
                 }
@@ -1039,8 +1050,11 @@ extern "C" bool ShadowChaosControl_IsBusy(void) {
 // 2 = the version where Y and X work once time has stopped.
 // 3 = 30 second time stop, greyscale world with red after images and aura, red copies of struck enemies.
 // 4 = works with the boomerang (and other items) in hand.
+// 5 = boot crash fix (the reset does not touch the player actor).
+// 6 = Shadow in colour in the time stop look, 27 second freeze, wider after image spacing, visible aura pulse.
+// 7 = no aura or new after image while the homing attack hides Shadow.
 extern "C" {
-int ShadowAbilityVersion_ChaosControl = 5;
+int ShadowAbilityVersion_ChaosControl = 7;
 }
 
 // ----- The red time stop look (version 3) ---------------------------------------------------------
@@ -1110,13 +1124,30 @@ static int sFxSinceSpawn = 0;          // game frames since the last after image
 static Vec3f sFxLastGhostPos = { 0.0f, 0.0f, 0.0f };
 static bool sFxHaveLastGhostPos = false;
 static float sFxWeight = 0.0f;         // 0..1: how much of the look is on (greyscale amount, aura strength)
-static float sFxPulse = 0.0f;          // aura pulse, set to 1 when a new after image is made
+static std::chrono::steady_clock::time_point sFxPulseAt; // when the aura last pulsed (a new after image, or the drop)
+static bool sFxPulseOn = false;
 static int sFxDropAge = -2;            // game frames since the drop (flash and ring), -2 = none
 static uint32_t sFxTick = 0;           // counts game frames
 static uint32_t sFxSpawnTick = 0xFFFFFFFFu;
 static bool sFxGrayOn = false;         // greyscale was switched on in this frame's display lists
 static Actor* sFxWrapped = nullptr;    // the player actor our draw function was put into
+static ActorFunc sFxOrigDraw = nullptr; // what the actor's draw function was before we put ours in
 static int sFxGhostSkelState[2] = { -1, -1 }; // adult, child: -1 not checked, 0 missing, 1 found
+
+// The aura pulse: 1 at the moment a new after image is made, dying away fast (about 70 ms to a third). It is measured in
+// real time, not in game frames, so every rendered frame (not only every fifth one at 60 fps) shows a different step of it.
+static void FxStartPulse() {
+    sFxPulseAt = std::chrono::steady_clock::now();
+    sFxPulseOn = true;
+}
+
+static float FxPulse() {
+    if (!sFxPulseOn) {
+        return 0.0f;
+    }
+    const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - sFxPulseAt).count();
+    return ms >= 400.0f ? 0.0f : std::exp(-std::max(0.0f, ms) / 65.0f);
+}
 
 static bool FxEnabled() {
     return CVarGetInteger(kCvarEnabled, 1) != 0 && CVarGetInteger(kCvarFx, 1) != 0;
@@ -1178,7 +1209,9 @@ static void FxPlayerDraw(Actor* thisx, PlayState* play) {
         gSPGrayscale(POLY_OPA_DISP++, false);
         gSPGrayscale(POLY_XLU_DISP++, false);
     }
-    Player_Draw(thisx, play);
+    if (sFxOrigDraw != nullptr) {
+        sFxOrigDraw(thisx, play);
+    }
     if (sFxGrayOn) {
         const u8 amount = FxGrayAmount();
         gSPGrayscale(POLY_OPA_DISP++, true);
@@ -1190,18 +1223,24 @@ static void FxPlayerDraw(Actor* thisx, PlayState* play) {
 }
 
 // Puts our draw function in the player's place while the look is on, and the game's own back afterwards.
+// The player's draw function in his actor is the game's PlayerCall_Draw (it loads the player code and then calls
+// Player_Draw), not Player_Draw itself, so we keep whatever is there instead of comparing it with Player_Draw. (Version 4
+// compared it with Player_Draw, never found it, never installed the wrapper, and so left Shadow in the greyscale.)
 static void FxSetDrawWrapper(Player* player, bool wrap) {
     Actor* actor = &player->actor;
     if (wrap) {
         if (actor->draw == FxPlayerDraw) {
             sFxWrapped = actor;
-        } else if (actor->draw == Player_Draw) {
+        } else if (actor->draw != nullptr && !(ShadowBoost_IsPlayerDrawWrapper != nullptr &&
+                                               ShadowBoost_IsPlayerDrawWrapper(actor->draw))) {
+            // (Boost's wrapper, when it is on, already keeps Shadow in colour, and is not wrapped again: the two would
+            // call each other for ever.)
+            sFxOrigDraw = actor->draw;
             actor->draw = FxPlayerDraw;
             sFxWrapped = actor;
         }
-        // Anything else is Boost's wrapper: it keeps Shadow in colour, nothing to add.
-    } else if (actor->draw == FxPlayerDraw) {
-        actor->draw = Player_Draw;
+    } else if (actor->draw == FxPlayerDraw && sFxOrigDraw != nullptr) {
+        actor->draw = sFxOrigDraw;
     }
 }
 
@@ -1211,13 +1250,13 @@ static void FxReset() {
     sFxSinceSpawn = 0;
     sFxHaveLastGhostPos = false;
     sFxWeight = 0.0f;
-    sFxPulse = 0.0f;
+    sFxPulseOn = false;
     sFxDropAge = -2;
     sFxGrayOn = false;
     // Deliberately does NOT touch the player actor or walk the actor lists. This runs from the scene init hook, which the
     // game calls before it has set up the actor lists of the new play state (garbage on the first scene, stale after a
     // scene change), and from the load and exit hooks, where the play state may already be gone. The draw wrapper needs no
-    // undoing here: FxDrawBegin puts Player_Draw back on the next frame (the weight is 0 now, so nothing is wanted), and
+    // undoing here: FxDrawBegin puts the game's draw function back on the next frame (the weight is 0 now, so nothing is wanted), and
     // after a scene change the old player actor, and the wrapper in it, no longer exist.
     sFxWrapped = nullptr;
 }
@@ -1233,7 +1272,7 @@ static void FxOnDrop() {
     sFxDropAge = -1; // the game frame update that follows makes it 0, the first frame that is drawn
     sFxSinceSpawn = 1000;
     sFxHaveLastGhostPos = false;
-    sFxPulse = 1.0f;
+    FxStartPulse();
 }
 
 // Once per game frame, after the player's update.
@@ -1245,10 +1284,6 @@ static void FxTick() {
     } else {
         sFxWeight = std::max(0.0f, sFxWeight - step);
     }
-    sFxPulse *= 0.6f;
-    if (sFxPulse < 0.03f) {
-        sFxPulse = 0.0f;
-    }
     if (sFxDropAge > -2 && ++sFxDropAge > kFxDropFlashFrames) {
         sFxDropAge = -2;
     }
@@ -1259,7 +1294,7 @@ static void FxTick() {
         std::memset(sFxGhosts, 0, sizeof(sFxGhosts));
         std::memset(sFxHitGhosts, 0, sizeof(sFxHitGhosts));
     }
-    const int life = FxClamp(CVarGetInteger(kCvarFxLife, 10), 3, 40);
+    const int life = FxClamp(CVarGetInteger(kCvarFxLife, 14), 3, 40);
     for (FxGhost& g : sFxGhosts) {
         if (g.used && ++g.age >= life) {
             g.used = false;
@@ -1309,10 +1344,11 @@ static void FxTrySpawnGhost(Player* player) {
         return;
     }
     sFxSpawnTick = sFxTick;
-    if (!FxEnabled() || CVarGetInteger(kCvarFxAfter, 1) == 0 || sState != State::Active) {
+    if (!FxEnabled() || CVarGetInteger(kCvarFxAfter, 1) == 0 || sState != State::Active ||
+        (player->stateFlags2 & PLAYER_STATE2_DISABLE_DRAW) != 0) { // not while the homing attack hides Shadow
         return;
     }
-    const int interval = FxClamp(CVarGetInteger(kCvarFxInterval, 2), 1, 20);
+    const int interval = FxClamp(CVarGetInteger(kCvarFxInterval, 4), 1, 20); // Shadow is slower here than in the boost
     if (sFxSinceSpawn < interval || player->skelAnime.jointTable == nullptr || player->skelAnime.limbCount < kJoints ||
         FxGhostSkeleton(FxIsChild()) == nullptr) {
         return;
@@ -1350,7 +1386,7 @@ static void FxTrySpawnGhost(Player* player) {
     slot->upperYawSecondary = player->upperLimbYawSecondary;
     std::memcpy(slot->joints, player->skelAnime.jointTable, sizeof(slot->joints));
     sFxSinceSpawn = 0;
-    sFxPulse = 1.0f; // the aura pulses when an after image appears
+    FxStartPulse(); // the aura pulses when an after image appears
     sFxLastGhostPos = pos;
     sFxHaveLastGhostPos = true;
 }
@@ -1427,7 +1463,7 @@ static void FxDrawGhosts(PlayState* play, const Player* player) {
     if (!FxEnabled() || CVarGetInteger(kCvarFxAfter, 1) == 0) {
         return;
     }
-    const float life = static_cast<float>(FxClamp(CVarGetInteger(kCvarFxLife, 10), 3, 40));
+    const float life = static_cast<float>(FxClamp(CVarGetInteger(kCvarFxLife, 14), 3, 40));
     const float opacity = static_cast<float>(FxClamp(CVarGetInteger(kCvarFxOpacity, 55), 0, 100)) / 100.0f;
     // Oldest first, so the newest is drawn on top.
     const FxGhost* order[kFxMaxGhosts];
@@ -1716,8 +1752,10 @@ static void FxDrawAura(PlayState* play, const Player* player) {
     }
     const bool child = FxIsChild();
     const float flashT = flash ? 1.0f - static_cast<float>(sFxDropAge) / static_cast<float>(kFxDropFlashFrames) : 0.0f;
-    const float radius = (child ? 44.0f : 58.0f) * (1.0f + 0.07f * sFxPulse + 0.9f * flashT);
-    const float alpha = std::min(0.9f, ((0.38f + 0.40f * sFxPulse) * weight + 0.55f * flashT) * strength);
+    // The pulse (AuraPulse, percent): the aura swells and brightens when a new after image appears, then settles.
+    const float pulse = FxPulse() * static_cast<float>(FxClamp(CVarGetInteger(kCvarFxAuraPulse, 100), 0, 300)) / 100.0f;
+    const float radius = (child ? 44.0f : 58.0f) * (1.0f + 0.22f * pulse + 0.9f * flashT);
+    const float alpha = std::min(0.9f, ((0.30f + 0.50f * pulse) * weight + 0.55f * flashT) * strength);
 
     // The middle of the aura: his chest, pushed a little away from the camera, so his body is in front of it.
     Vec3f centre = player->actor.world.pos;
@@ -1806,7 +1844,9 @@ static void FxDrawEnd() {
     }
     FxDrawGhosts(gPlayState, player);
     FxDrawHitGhosts(gPlayState);
-    FxDrawAura(gPlayState, player);
+    if ((player->stateFlags2 & PLAYER_STATE2_DISABLE_DRAW) == 0) { // no aura around a hidden Shadow (homing attack)
+        FxDrawAura(gPlayState, player);
+    }
 }
 
 // ----- The duration bar ---------------------------------------------------------------------------
