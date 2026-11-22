@@ -110,6 +110,8 @@ void Player_Action_8084411C(Player* player, PlayState* play);
 
 // Provided by ChaosControl.cpp. True while Chaos Control holds Link still. Weak, so this file also works without it.
 extern "C" __attribute__((weak)) bool ShadowChaosControl_IsBusy(void);
+// Provided by InhibitorRings.cpp. True while Shadow takes his inhibitor rings off (he is held still). Weak.
+extern "C" __attribute__((weak)) bool ShadowRings_IsBusy(void);
 
 // Provided by HomingAttack.cpp (version 2 and later). IsBusy: a homing attack is running. EnemiesAtFullSpeed: the same, plus
 // three frames after it, so a hit gets processed. Weak, so this file also works without HomingAttack.cpp.
@@ -714,7 +716,8 @@ u16 sHiddenCur = 0;
 u16 sHiddenPress = 0;
 
 bool ChaosControlBusy() {
-    return ShadowChaosControl_IsBusy != nullptr && ShadowChaosControl_IsBusy();
+    return (ShadowChaosControl_IsBusy != nullptr && ShadowChaosControl_IsBusy()) ||
+           (ShadowRings_IsBusy != nullptr && ShadowRings_IsBusy());
 }
 
 bool SoundOn() {
@@ -1887,6 +1890,12 @@ extern "C" bool ShadowBoost_IsBusy(void) {
     return sState == State::Windup;
 }
 
+// Used by InhibitorRings.cpp: true while the boost itself runs (not the charge-up), so the faster run of the rings leaves his
+// speed alone and the rings cannot be started in the middle of a boost.
+extern "C" bool ShadowBoost_IsActive(void) {
+    return sState == State::Active;
+}
+
 // Used by ChaosControl.cpp: true when fn is this file's draw wrapper, so the two files never wrap each other's wrapper.
 extern "C" bool ShadowBoost_IsPlayerDrawWrapper(ActorFunc fn) {
     return fn == ShadowPlayerDraw;
@@ -1901,6 +1910,7 @@ extern "C" bool ShadowBoost_IsPlayerDrawWrapper(ActorFunc fn) {
 // 11 = aura pulse is visible (real-time pulse on every new after image).
 // 12 = works with the homing attack: the boost leaves Shadow's speed alone while it runs, enemies are not slowed down
 //      during it (so the hit does damage), no aura or new after image while Shadow is hidden by it.
+// 13 = works with the inhibitor rings: X cannot break out of the rings pose, and the rings' faster run leaves a boost alone.
 extern "C" {
-int ShadowAbilityVersion_Boost = 12;
+int ShadowAbilityVersion_Boost = 13;
 }
