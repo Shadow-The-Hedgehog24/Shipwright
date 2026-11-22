@@ -67,6 +67,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -110,6 +111,11 @@ void Player_Action_8084411C(Player* player, PlayState* play);
 // Provided by ChaosControl.cpp. True while Chaos Control holds Link still. Weak, so this file also works without it.
 extern "C" __attribute__((weak)) bool ShadowChaosControl_IsBusy(void);
 
+// Provided by HomingAttack.cpp (version 2 and later). IsBusy: a homing attack is running. EnemiesAtFullSpeed: the same, plus
+// three frames after it, so a hit gets processed. Weak, so this file also works without HomingAttack.cpp.
+extern "C" __attribute__((weak)) bool ShadowHoming_IsBusy(void);
+extern "C" __attribute__((weak)) bool ShadowHoming_EnemiesAtFullSpeed(void);
+
 namespace {
 
 constexpr const char* kCvarEnabled = "gShadow.Boost.Enabled";
@@ -137,6 +143,7 @@ constexpr const char* kCvarFxLife = "gShadow.Boost.AfterimageLife";
 constexpr const char* kCvarFxOpacity = "gShadow.Boost.AfterimageOpacity";
 constexpr const char* kCvarFxAura = "gShadow.Boost.Aura";
 constexpr const char* kCvarFxAuraStrength = "gShadow.Boost.AuraStrength";
+constexpr const char* kCvarFxAuraPulse = "gShadow.Boost.AuraPulse";
 
 constexpr const char* kFileRunAdult = "custom/boost/anim_run_adult.bin";
 constexpr const char* kFileRunChild = "custom/boost/anim_run_child.bin";
@@ -687,7 +694,8 @@ int sSinceSpawn = 0;          // game frames since the last after image
 Vec3f sLastGhostPos = { 0.0f, 0.0f, 0.0f };
 bool sHaveLastGhostPos = false;
 float sFxWeight = 0.0f;       // 0..1: how much of the look is on (greyscale amount, aura strength)
-float sPulse = 0.0f;          // aura pulse, set to 1 when a new after image is made
+std::chrono::steady_clock::time_point sPulseAt; // when the aura last pulsed (a new after image, or the drop)
+bool sPulseOn = false;
 int sDropAge = -2;            // game frames since the drop (flash and ring), -2 = none
 uint32_t sFxTick = 0;         // counts game frames
 uint32_t sFxSpawnTick = 0xFFFFFFFFu;
@@ -946,7 +954,10 @@ void ShouldActorUpdateBoost(void* refActor, bool* result) {
         return;
     }
     if (static_cast<Actor*>(refActor) != &player->actor) {
+        // Not during a homing attack (version 12): the game throws an enemy's damage away in a frame in which it does not
+        // update, and the hit of the attack lands one frame after it is registered, so at half speed it would do nothing.
         if (sState == State::Active && (gPlayState->gameplayFrames & 1) != 0 && CVarGetInteger(kCvarSlowOthers, 1) != 0 &&
+            !(ShadowHoming_EnemiesAtFullSpeed != nullptr && ShadowHoming_EnemiesAtFullSpeed()) &&
             SlowedByBoost(static_cast<Actor*>(refActor), player)) {
             *result = false;
         }
@@ -1162,6 +1173,17 @@ void UpdateBoost() {
     Player_GetMovementSpeedAndYaw(player, &speedTarget, &yawTarget, 0.018f, gPlayState);
     // The game brakes (and turns on the spot) when the stick points more than 135 degrees away from where Link runs.
     const bool reversing = stickHeld && std::abs(static_cast<int>(static_cast<s16>(player->yaw - yawTarget))) > 0x6000;
+
+    // A homing attack (HomingAttack.cpp) is running: it sets Shadow's position and speed itself (the vanish, the strike, the
+    // bounce), so the boost leaves them alone until it is over (version 12). The boost carries on afterwards at its speed.
+    if (ShadowHoming_IsBusy != nullptr && ShadowHoming_IsBusy()) {
+        sAirFrames = 0;
+        sStuckCount = 0;
+        sNeutralCount = 0;
+        sLastX = player->actor.world.pos.x;
+        sLastZ = player->actor.world.pos.z;
+        return;
+    }
 
     // The speed. This runs after Link's own update; his movement next frame uses linearVelocity.
     if (inJump) {
@@ -1410,12 +1432,27 @@ void SetDrawWrapper(Player* player, bool wrap) {
     }
 }
 
+// The aura pulse: 1 at the moment a new after image is made, dying away fast (about 70 ms to a third). It is measured in
+// real time, not in game frames, so every rendered frame (not only every fifth one at 60 fps) shows a different step of it.
+void StartPulse() {
+    sPulseAt = std::chrono::steady_clock::now();
+    sPulseOn = true;
+}
+
+float PulseNow() {
+    if (!sPulseOn) {
+        return 0.0f;
+    }
+    const float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - sPulseAt).count();
+    return ms >= 400.0f ? 0.0f : std::exp(-std::max(0.0f, ms) / 65.0f);
+}
+
 void FxReset() {
     std::memset(sGhosts, 0, sizeof(sGhosts));
     sSinceSpawn = 0;
     sHaveLastGhostPos = false;
     sFxWeight = 0.0f;
-    sPulse = 0.0f;
+    sPulseOn = false;
     sDropAge = -2;
     sGrayOn = false; // sGrayWasOn stays, so the next frame switches the greyscale off in the display lists
     // Deliberately does NOT touch the player actor. This runs from the scene init hook, which the game calls before it has
@@ -1436,17 +1473,13 @@ void FxOnDrop() {
     sDropAge = -1; // the game frame update that follows makes it 0, the first frame that is drawn
     sSinceSpawn = 1000;
     sHaveLastGhostPos = false;
-    sPulse = 1.0f;
+    StartPulse();
 }
 
 // Once per game frame, after the player's update.
 void FxTick() {
     const bool on = FxEnabled() && sState == State::Active;
     sFxWeight = Approach(sFxWeight, on ? 1.0f : 0.0f, 1.0f / static_cast<float>(kFxFadeFrames));
-    sPulse *= 0.6f;
-    if (sPulse < 0.03f) {
-        sPulse = 0.0f;
-    }
     if (sDropAge > -2 && ++sDropAge > kDropFlashFrames) {
         sDropAge = -2;
     }
@@ -1515,7 +1548,8 @@ void TrySpawnGhost(Player* player) {
         return;
     }
     sFxSpawnTick = sFxTick;
-    if (!FxEnabled() || CVarGetInteger(kCvarFxAfter, 1) == 0 || sState != State::Active) {
+    if (!FxEnabled() || CVarGetInteger(kCvarFxAfter, 1) == 0 || sState != State::Active ||
+        (player->stateFlags2 & PLAYER_STATE2_DISABLE_DRAW) != 0) { // not while the homing attack hides Shadow
         return;
     }
     const int interval = ClampInt(CVarGetInteger(kCvarFxInterval, 2), 1, 20);
@@ -1556,7 +1590,7 @@ void TrySpawnGhost(Player* player) {
     slot->upperYawSecondary = player->upperLimbYawSecondary;
     std::memcpy(slot->joints, player->skelAnime.jointTable, sizeof(slot->joints));
     sSinceSpawn = 0;
-    sPulse = 1.0f; // the aura pulses when an after image appears
+    StartPulse(); // the aura pulses when an after image appears
     sLastGhostPos = pos;
     sHaveLastGhostPos = true;
 }
@@ -1729,8 +1763,10 @@ void DrawAura(PlayState* play, const Player* player) {
     }
     const bool child = IsChild();
     const float flashT = flash ? 1.0f - static_cast<float>(sDropAge) / static_cast<float>(kDropFlashFrames) : 0.0f;
-    const float radius = (child ? 44.0f : 58.0f) * (1.0f + 0.07f * sPulse + 0.9f * flashT);
-    const float alpha = std::min(0.9f, ((0.38f + 0.40f * sPulse) * weight + 0.55f * flashT) * strength);
+    // The pulse (AuraPulse, percent): the aura swells and brightens when a new after image appears, then settles.
+    const float pulse = PulseNow() * static_cast<float>(ClampInt(CVarGetInteger(kCvarFxAuraPulse, 100), 0, 300)) / 100.0f;
+    const float radius = (child ? 44.0f : 58.0f) * (1.0f + 0.22f * pulse + 0.9f * flashT);
+    const float alpha = std::min(0.9f, ((0.30f + 0.50f * pulse) * weight + 0.55f * flashT) * strength);
 
     // The middle of the aura: his chest, pushed a little away from the camera, so his body is in front of it.
     Vec3f centre = player->actor.world.pos;
@@ -1815,7 +1851,9 @@ void OnPlayDrawEndBoost() {
         BOOST_CLOSE_DISPS();
     }
     DrawGhosts(gPlayState, player);
-    DrawAura(gPlayState, player);
+    if ((player->stateFlags2 & PLAYER_STATE2_DISABLE_DRAW) == 0) { // no aura around a hidden Shadow (homing attack)
+        DrawAura(gPlayState, player);
+    }
 }
 
 void RegisterBoost() {
@@ -1849,11 +1887,20 @@ extern "C" bool ShadowBoost_IsBusy(void) {
     return sState == State::Windup;
 }
 
+// Used by ChaosControl.cpp: true when fn is this file's draw wrapper, so the two files never wrap each other's wrapper.
+extern "C" bool ShadowBoost_IsPlayerDrawWrapper(ActorFunc fn) {
+    return fn == ShadowPlayerDraw;
+}
+
 // Read by the status report in Jump.cpp: tells it that this file is in the build, and which version it is.
 // 3 = Chaos Control style charge-up with the tune, burst at the drop, boost survives jumps.
 // 7 = greyscale world, blue after images (shadow_ghost.o2r) and aura while boosting.
 // 8 = works with the boomerang (and other items) in hand.
 // 9 = the "Boost blocked" message names the reason.
+// 10 = boot crash fix (the reset does not touch the player actor).
+// 11 = aura pulse is visible (real-time pulse on every new after image).
+// 12 = works with the homing attack: the boost leaves Shadow's speed alone while it runs, enemies are not slowed down
+//      during it (so the hit does damage), no aura or new after image while Shadow is hidden by it.
 extern "C" {
-int ShadowAbilityVersion_Boost = 10;
+int ShadowAbilityVersion_Boost = 12;
 }
